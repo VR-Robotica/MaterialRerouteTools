@@ -4,6 +4,7 @@
 
 class UMaterialGraph;
 class UMaterialExpression;
+class UMaterialExpressionMaterialFunctionCall;
 
 /**
  * "Create Parameter Data Function": moves selected material parameters (and the few nodes that only shape them) into
@@ -18,6 +19,9 @@ class UMaterialExpression;
  *              "s_|vec2_|vec3_|vec4_<Name>", and every place that read a moved node now reads a usage of it.
  *
  * Parameters keep their names, groups and defaults inside the function, so material instances keep their overrides.
+ *
+ * "Add to Parameter Data Function" does the same into a function the material already calls, appending outputs
+ * (and inputs) after the existing ones and reusing what the function already has.
  */
 namespace VrrParameterData
 {
@@ -26,4 +30,10 @@ namespace VrrParameterData
 
 	/** Runs the whole operation on the selection: asks where to save the function, builds it, rewires the material. */
 	void CreateFromSelection(UMaterialGraph* Graph);
+
+	/** One call per parameter data function the material calls (named PARAM_*, or made by this tool), sorted by name. */
+	TArray<UMaterialExpressionMaterialFunctionCall*> GetParameterDataCalls(const UMaterialGraph* Graph);
+
+	/** Runs the operation into the function Call calls, wiring the new outputs through Call. */
+	void AddToFunction(UMaterialGraph* Graph, UMaterialExpressionMaterialFunctionCall* Call);
 }

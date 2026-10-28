@@ -1,7 +1,8 @@
 /*
  * VRR_MaterialsEditor: editor-only tools for VRR_Materials.
  *
- * Adds "Create Parameter Data Function" to the material graph's right-click menu (see Vrr_ParameterDataFunction).
+ * Adds "Create Parameter Data Function" and "Add to Parameter Data Function >" (one entry per parameter data function
+ * the material calls) to the material graph's right-click menu (see Vrr_ParameterDataFunction).
  * The entry goes into the material node context menu through ToolMenus, so no engine code is touched; it only
  * shows when a node was right-clicked in a material (not a material function) and the selection has parameters.
  */
@@ -10,6 +11,8 @@
 #include "ToolMenus.h"
 #include "EdGraph/EdGraphNode.h"
 #include "MaterialGraph/MaterialGraph.h"
+#include "Materials/MaterialExpressionMaterialFunctionCall.h"
+#include "Materials/MaterialFunctionInterface.h"
 #include "Vrr_ParameterDataFunction.h"
 
 #define LOCTEXT_NAMESPACE "VRR_MaterialsEditor"
@@ -71,6 +74,48 @@ private:
 						VrrParameterData::CreateFromSelection(G);
 					}
 				})));
+
+			// 3. Add to a parameter data function the material already calls: one entry per function
+			TArray<TWeakObjectPtr<UMaterialExpressionMaterialFunctionCall>> Calls;
+			for (UMaterialExpressionMaterialFunctionCall* Call : VrrParameterData::GetParameterDataCalls(Graph))
+			{
+				Calls.Add(Call);
+			}
+			if (Calls.IsEmpty())
+			{
+				return;
+			}
+			Section.AddSubMenu(
+				"AddToParameterDataFunction",
+				LOCTEXT("AddLabel", "Add to Parameter Data Function"),
+				FText::Format(LOCTEXT("AddTooltip",
+					"Move the {0} selected parameter(s) into a parameter data function this material already calls. New "
+					"outputs are added after the existing ones and read through new named reroutes; parameters the function "
+					"already has are reused."), NumParameters),
+				FNewToolMenuDelegate::CreateLambda([WeakGraph, Calls](UToolMenu* SubMenu)
+				{
+					FToolMenuSection& Functions = SubMenu->AddSection("Functions", LOCTEXT("FunctionsLabel", "Functions"));
+					for (const TWeakObjectPtr<UMaterialExpressionMaterialFunctionCall>& WeakCall : Calls)
+					{
+						const UMaterialExpressionMaterialFunctionCall* Call = WeakCall.Get();
+						if (!Call || !Call->MaterialFunction)
+						{
+							continue;
+						}
+						Functions.AddMenuEntry(
+							FName(Call->MaterialFunction->GetName()),
+							FText::FromString(Call->MaterialFunction->GetName()),
+							FText::FromString(Call->MaterialFunction->GetPathName()),
+							FSlateIcon(),
+							FUIAction(FExecuteAction::CreateLambda([WeakGraph, WeakCall]()
+							{
+								if (UMaterialGraph* G = WeakGraph.Get())
+								{
+									VrrParameterData::AddToFunction(G, WeakCall.Get());
+								}
+							})));
+					}
+				}));
 		}));
 	}
 };

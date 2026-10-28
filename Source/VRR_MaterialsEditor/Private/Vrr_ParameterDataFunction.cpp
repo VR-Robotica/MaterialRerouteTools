@@ -29,22 +29,34 @@
  *  The material editor edits a temporary copy of the material, so all material changes go to that copy (inside one
  *  undo transaction) and the graph is rebuilt; the user applies / saves as usual. The function is a new saved asset.
  *
+ *  Add to Parameter Data Function does the same into a function the material already calls (a PARAM_ function, or
+ *  one this tool made), through that call:
+ *   - new nodes go below the function's content, new outputs / inputs after its existing ones (sort priority), so
+ *     the call's existing pins and links don't move; output / input names never repeat one already in use,
+ *   - a parameter the function already has (same name) isn't copied again: the function's node stands in for it,
+ *     and if an output already gives the same pin and type, that output (and its reroute, if any) is reused,
+ *   - new function inputs use their preview value as default, so other materials calling the function still
+ *     compile without wiring them (they don't read the new outputs anyway),
+ *   - the function asset is edited and saved directly, so it must not be open in its own editor.
+ *
  * Steps
  *  1. Collect the selected parameters and map who reads what in the material.
  *  2. Grow the moved set: texture samples of selected texture objects, then appends of moved values.
  *  3. Group into outputs (same-named parameters are one), pick each output's type, name and source pin.
- *  4. Ask where to save the function (defaults to PARAM_<Material> next to the material, "M_" prefix dropped).
+ *  4. Ask where to save the function (defaults to PARAM_<Material> next to the material, "M_" prefix dropped), or,
+ *     when adding, use the target function (parameters it already has stand in for their copies, step 3').
  *  5. Build the function: copies of the moved nodes (relinked to each other), function inputs for outside links,
  *     outputs "<Name> (S|V2|V3|V4)", then save it.
- *  6. In the material: add the call (inputs wired to the original sources), a named reroute
+ *  6. In the material: add the call or refresh the target call (new inputs wired to the original sources), a named reroute
  *     "s_|vec2_|vec3_|vec4_<Name>" per output, a reroute usage next to every read, then delete the moved nodes.
- *  7. Rebuild the graph and tell the material editor it changed.
+ *  7. Rebuild the graph, tell the material editor it changed, and select the call and its named reroute declarations.
  */
 
 #include "Vrr_ParameterDataFunction.h"
 
 #include "AssetToolsModule.h"
 #include "ContentBrowserModule.h"
+#include "Editor.h"
 #include "IContentBrowserSingleton.h"
 #include "Factories/MaterialFunctionFactoryNew.h"
 #include "FileHelpers.h"
@@ -71,6 +83,7 @@
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Misc/PackageName.h"
 #include "ScopedTransaction.h"
+#include "Subsystems/AssetEditorSubsystem.h"
 #include "Widgets/Notifications/SNotificationList.h"
 
 #define LOCTEXT_NAMESPACE "VrrParameterData"
@@ -101,6 +114,7 @@ namespace VrrParameterData
 		bool bClearReadMasks = false;			// single-channel scalar: reads must not mask it again
 		TArray<FLink> Reads;
 		UMaterialExpressionNamedRerouteDeclaration* Declaration = nullptr;
+		UMaterialExpressionFunctionOutput* ExistingOutput = nullptr;	// adding to a function: an output that already gives this value
 	};
 
 	/** A link from outside the moved set into a moved node: becomes a function input. */
@@ -142,6 +156,20 @@ namespace VrrParameterData
 		case EType::V4: return FLinearColor(1.0f, 0.0f, 0.82f);
 		default:        return FLinearColor(0.2f, 0.6f, 1.0f);
 		}
+	}
+
+	/** "Tiling (V2)" -> "Tiling": an output's name without its type suffix. */
+	FString StripSuffix(const FString& OutputName)
+	{
+		for (EType Type : { EType::S, EType::V2, EType::V3, EType::V4 })
+		{
+			const FString Ending = FString(TEXT(" ")) + Suffix(Type);
+			if (OutputName.EndsWith(Ending))
+			{
+				return OutputName.LeftChop(Ending.Len());
+			}
+		}
+		return OutputName;
 	}
 
 	EType TypeForWidth(int32 Width)
@@ -304,6 +332,9 @@ namespace VrrParameterData
 		return FMaterialEditorUtilities::GetIMaterialEditorForObject(Graph);
 	}
 
+	/** Marker written into the Description of functions this tool creates. */
+	const TCHAR* const MadeByTool = TEXT("(Create Parameter Data Function)");
+
 	void Notify(const FText& Message, bool bSuccess)
 	{
 		FNotificationInfo Info(Message);
@@ -332,6 +363,33 @@ namespace VrrParameterData
 				Result.Add(Expression);
 			}
 		}
+		return Result;
+	}
+
+	TArray<UMaterialExpressionMaterialFunctionCall*> GetParameterDataCalls(const UMaterialGraph* Graph)
+	{
+		TArray<UMaterialExpressionMaterialFunctionCall*> Result;
+		const UMaterial* Material = Graph ? Graph->Material.Get() : nullptr;
+		if (!Material)
+		{
+			return Result;
+		}
+		TSet<const UMaterialFunction*> Seen;
+		for (UMaterialExpression* Expression : Material->GetExpressions())
+		{
+			UMaterialExpressionMaterialFunctionCall* Call = Cast<UMaterialExpressionMaterialFunctionCall>(Expression);
+			const UMaterialFunction* Function = Call ? Cast<UMaterialFunction>(Call->MaterialFunction) : nullptr;	// not function instances
+			if (Function && !Seen.Contains(Function)
+				&& (Function->GetName().StartsWith(TEXT("PARAM_")) || Function->Description.Contains(MadeByTool)))
+			{
+				Seen.Add(Function);
+				Result.Add(Call);
+			}
+		}
+		Result.Sort([](const UMaterialExpressionMaterialFunctionCall& A, const UMaterialExpressionMaterialFunctionCall& B)
+		{
+			return A.MaterialFunction->GetName() < B.MaterialFunction->GetName();
+		});
 		return Result;
 	}
 
@@ -390,7 +448,76 @@ namespace VrrParameterData
 		return true;
 	}
 
-	void CreateFromSelection(UMaterialGraph* Graph)
+	/** Everything already in a function the selection is being added to. */
+	struct FExistingFunction
+	{
+		TMap<FName, UMaterialExpression*> Parameters;			// by parameter name
+		TArray<UMaterialExpressionFunctionOutput*> Outputs;
+		TSet<FString> Names;									// output (without type suffix) and input names in use
+		int32 MaxOutputPriority = -1;
+		int32 MaxInputPriority = -1;
+		int32 OutputX = 0;										// where the outputs sit (new ones line up with them)
+		int32 BottomY = 0;										// lowest node, new nodes go below it
+
+		explicit FExistingFunction(const UMaterialFunction* Function)
+		{
+			bool bAny = false;
+			for (UMaterialExpression* E : Function->GetExpressions())
+			{
+				if (!E)
+				{
+					continue;
+				}
+				BottomY = bAny ? FMath::Max(BottomY, E->MaterialExpressionEditorY) : E->MaterialExpressionEditorY;
+				bAny = true;
+				if (UMaterialExpressionFunctionOutput* Output = Cast<UMaterialExpressionFunctionOutput>(E))
+				{
+					OutputX = Outputs.IsEmpty() ? Output->MaterialExpressionEditorX : FMath::Max(OutputX, Output->MaterialExpressionEditorX);
+					Outputs.Add(Output);
+					Names.Add(StripSuffix(Output->OutputName.ToString()));
+					MaxOutputPriority = FMath::Max(MaxOutputPriority, Output->SortPriority);
+				}
+				else if (const UMaterialExpressionFunctionInput* Input = Cast<UMaterialExpressionFunctionInput>(E))
+				{
+					Names.Add(Input->InputName.ToString());
+					MaxInputPriority = FMath::Max(MaxInputPriority, Input->SortPriority);
+				}
+				else if (E->HasAParameterName() && !E->GetParameterName().IsNone())
+				{
+					Parameters.FindOrAdd(E->GetParameterName(), E);
+				}
+			}
+		}
+
+		/** An output that already gives Node's Pin as Type (straight, or through the RG mask a V2 uses). */
+		UMaterialExpressionFunctionOutput* FindOutput(const UMaterialExpression* Node, int32 Pin, bool bMaskRG, EType Type) const
+		{
+			for (UMaterialExpressionFunctionOutput* Output : Outputs)
+			{
+				const UMaterialExpression* From = Output->A.Expression;
+				int32 FromPin = Output->A.OutputIndex;
+				bool bThroughRG = false;
+				if (const UMaterialExpressionComponentMask* Mask = Cast<UMaterialExpressionComponentMask>(From))
+				{
+					if (!(Mask->R && Mask->G && !Mask->B && !Mask->A))
+					{
+						continue;
+					}
+					From = Mask->Input.Expression;
+					FromPin = Mask->Input.OutputIndex;
+					bThroughRG = true;
+				}
+				if (From == Node && FromPin == Pin && bThroughRG == bMaskRG && Output->OutputName.ToString().EndsWith(Suffix(Type)))
+				{
+					return Output;
+				}
+			}
+			return nullptr;
+		}
+	};
+
+	/** Create (TargetCall null) or add to the function TargetCall calls. Steps are listed at the top of the file. */
+	void Run(UMaterialGraph* Graph, UMaterialExpressionMaterialFunctionCall* TargetCall)
 	{
 		UMaterial* Material = Graph ? Graph->Material.Get() : nullptr;
 		const TSharedPtr<IMaterialEditor> Editor = GetEditor(Graph);
@@ -398,12 +525,34 @@ namespace VrrParameterData
 		{
 			return;
 		}
+		const bool bAdd = TargetCall != nullptr;
+		const FText Tool = bAdd ? LOCTEXT("AddTool", "Add to Parameter Data Function") : LOCTEXT("CreateTool", "Create Parameter Data Function");
+		auto Fail = [&Tool](const FText& Message) { Notify(FText::Format(LOCTEXT("Fail", "{0}: {1}"), Tool, Message), false); };
+
+		// 0. Adding: the target must be a plain function that isn't open in its own editor (that copy would overwrite ours)
+		UMaterialFunction* Function = nullptr;
+		TOptional<FExistingFunction> Existing;
+		if (bAdd)
+		{
+			Function = Cast<UMaterialFunction>(TargetCall->MaterialFunction);
+			if (!Function)
+			{
+				Fail(LOCTEXT("NotAFunction", "the target is not a material function."));
+				return;
+			}
+			if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->FindEditorForAsset(Function, false))
+			{
+				Fail(FText::Format(LOCTEXT("FunctionOpen", "{0} is open in an editor. Save and close it, then try again."), FText::FromString(Function->GetName())));
+				return;
+			}
+			Existing.Emplace(Function);
+		}
 
 		// 1. Selected parameters (top to bottom, as they sit in the graph) and who reads what
 		TArray<UMaterialExpression*> Selected = GetSelectedParameters(Graph);
 		if (Selected.IsEmpty())
 		{
-			Notify(LOCTEXT("NothingSelected", "Create Parameter Data Function: select parameters first."), false);
+			Fail(LOCTEXT("NothingSelected", "select parameters first."));
 			return;
 		}
 		auto ByPosition = [](const UMaterialExpression& A, const UMaterialExpression& B)
@@ -508,7 +657,7 @@ namespace VrrParameterData
 		}
 		if (Moved.IsEmpty())
 		{
-			Notify(FText::Format(LOCTEXT("NothingToMove", "Create Parameter Data Function: nothing to move.\nSkipped: {0}"), FText::FromString(FString::Join(Skipped, TEXT(", ")))), false);
+			Fail(FText::Format(LOCTEXT("NothingToMove", "nothing to move.\nSkipped: {0}"), FText::FromString(FString::Join(Skipped, TEXT(", ")))));
 			return;
 		}
 
@@ -523,19 +672,39 @@ namespace VrrParameterData
 				CanonicalOf.Add(E, E);
 				continue;
 			}
-			if (UMaterialExpression** Existing = ParameterByName.Find(Name))
+			if (UMaterialExpression** Earlier = ParameterByName.Find(Name))
 			{
-				if ((*Existing)->GetClass() != E->GetClass())
+				if ((*Earlier)->GetClass() != E->GetClass())
 				{
-					Notify(FText::Format(LOCTEXT("MixedTypes", "Create Parameter Data Function: '{0}' is the name of two different kinds of parameter."), FText::FromName(Name)), false);
+					Fail(FText::Format(LOCTEXT("MixedTypes", "'{0}' is the name of two different kinds of parameter."), FText::FromName(Name)));
 					return;
 				}
-				CanonicalOf.Add(E, *Existing);
+				CanonicalOf.Add(E, *Earlier);
 			}
 			else
 			{
 				ParameterByName.Add(Name, E);
 				CanonicalOf.Add(E, E);
+			}
+		}
+
+		// 3'. Adding: a parameter the function already has isn't copied again, the function's own node stands in for it
+		TMap<UMaterialExpression*, UMaterialExpression*> AlreadyInFunction;
+		if (Existing)
+		{
+			for (const TPair<FName, UMaterialExpression*>& Pair : ParameterByName)
+			{
+				UMaterialExpression* const* Found = Existing->Parameters.Find(Pair.Key);
+				if (!Found)
+				{
+					continue;
+				}
+				if ((*Found)->GetClass() != Pair.Value->GetClass())
+				{
+					Fail(FText::Format(LOCTEXT("MixedTypesExisting", "{0} already has a different kind of parameter named '{1}'."), FText::FromString(Function->GetName()), FText::FromName(Pair.Key)));
+					return;
+				}
+				AlreadyInFunction.Add(Pair.Value, *Found);
 			}
 		}
 
@@ -559,7 +728,7 @@ namespace VrrParameterData
 
 		// 3b. One output per canonical node read from outside, plus selected parameters nothing reads at all
 		TArray<FOutput> Outputs;
-		TSet<FString> UsedNames;
+		TSet<FString> UsedNames = Existing ? Existing->Names : TSet<FString>();	// new outputs / inputs never take a name in use
 		auto UniqueName = [&UsedNames](FString Name)
 		{
 			FString Candidate = Name;
@@ -699,30 +868,58 @@ namespace VrrParameterData
 		}
 		if (Outputs.IsEmpty())
 		{
-			Notify(LOCTEXT("NoOutputs", "Create Parameter Data Function: the selection has nothing the material reads."), false);
+			Fail(LOCTEXT("NoOutputs", "the selection has nothing the material reads."));
 			return;
 		}
 
-		// 4. Where to save the function
+		// 3f. Adding: a value the function already outputs (same node, pin and type) reuses that output
+		int32 ReusedOutputs = 0;
+		if (Existing)
+		{
+			for (FOutput& Output : Outputs)
+			{
+				UMaterialExpression* const* InFunction = AlreadyInFunction.Find(Output.Source);
+				if (InFunction)
+				{
+					Output.ExistingOutput = Existing->FindOutput(*InFunction, Output.SourcePin, Output.bMaskRG, Output.Type);
+				}
+				if (Output.ExistingOutput)
+				{
+					Output.Name = StripSuffix(Output.ExistingOutput->OutputName.ToString());
+					++ReusedOutputs;
+				}
+			}
+		}
+
+		// 4. Where the function goes: a new asset (ask where to save it), or the one being added to
 		const TArray<UObject*>* EditingObjects = Editor->GetObjectsCurrentlyBeingEdited();
 		const UObject* OriginalMaterial = EditingObjects && EditingObjects->Num() > 0 ? (*EditingObjects)[0] : Material;
-		FString PackagePath, AssetName;
-		if (!AskForFunctionPath(OriginalMaterial, PackagePath, AssetName))
+		FString AssetName;
+		if (!bAdd)
 		{
-			return;
+			FString PackagePath;
+			if (!AskForFunctionPath(OriginalMaterial, PackagePath, AssetName))
+			{
+				return;
+			}
+
+			// 5. Build the function
+			IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+			Function = Cast<UMaterialFunction>(AssetTools.CreateAsset(AssetName, PackagePath, UMaterialFunction::StaticClass(), NewObject<UMaterialFunctionFactoryNew>()));
+			if (!Function)
+			{
+				Fail(LOCTEXT("CreateFailed", "couldn't create the material function asset."));
+				return;
+			}
+			Function->Description = FString::Printf(TEXT("Parameter data moved out of %s %s."), *OriginalMaterial->GetName(), MadeByTool);
+		}
+		else
+		{
+			AssetName = Function->GetName();
 		}
 
-		// 5. Build the function
-		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
-		UMaterialFunction* Function = Cast<UMaterialFunction>(AssetTools.CreateAsset(AssetName, PackagePath, UMaterialFunction::StaticClass(), NewObject<UMaterialFunctionFactoryNew>()));
-		if (!Function)
-		{
-			Notify(LOCTEXT("CreateFailed", "Create Parameter Data Function: couldn't create the material function asset."), false);
-			return;
-		}
-		Function->Description = FString::Printf(TEXT("Parameter data moved out of %s (Create Parameter Data Function)."), *OriginalMaterial->GetName());
-
-		// 5a. Copies keep their layout, shifted so the right-most node sits left of the outputs
+		// 5a. Copies keep their layout, shifted so the right-most node sits left of the outputs (and, when adding,
+		//     below what the function already has)
 		int32 MinX = MAX_int32, MinY = MAX_int32, MaxX = MIN_int32;
 		for (const UMaterialExpression* E : Moved)
 		{
@@ -730,14 +927,20 @@ namespace VrrParameterData
 			MinY = FMath::Min(MinY, E->MaterialExpressionEditorY);
 			MaxX = FMath::Max(MaxX, E->MaterialExpressionEditorX);
 		}
-		const int32 ShiftX = -400 - MaxX;
-		const int32 ShiftY = -MinY;
+		const int32 OutputX = Existing ? Existing->OutputX : 0;
+		const int32 ShiftX = OutputX - 400 - MaxX;
+		const int32 ShiftY = (Existing ? Existing->BottomY + 250 : 0) - MinY;
 
 		TMap<UMaterialExpression*, UMaterialExpression*> CopyOf;
 		for (UMaterialExpression* E : Moved)
 		{
 			if (CanonicalOf[E] != E)
 			{
+				continue;
+			}
+			if (UMaterialExpression* const* InFunction = AlreadyInFunction.Find(E))
+			{
+				CopyOf.Add(E, *InFunction);
 				continue;
 			}
 			UMaterialExpression* Copy = DuplicateObject(E, Function);
@@ -758,9 +961,9 @@ namespace VrrParameterData
 		for (UMaterialExpression* E : Moved)
 		{
 			UMaterialExpression* const* CopyPtr = CopyOf.Find(E);
-			if (!CopyPtr)
+			if (!CopyPtr || AlreadyInFunction.Contains(E))
 			{
-				continue;
+				continue;	// duplicates, and the function's own nodes (already linked inside it)
 			}
 			UMaterialExpression* Copy = *CopyPtr;
 			for (FExpressionInputIterator It{ Copy }; It; ++It)
@@ -799,8 +1002,11 @@ namespace VrrParameterData
 						UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionFunctionInput::StaticClass(), Copy->MaterialExpressionEditorX - 350, Copy->MaterialExpressionEditorY));
 					FunctionInput->InputName = FName(Outside.Name);
 					FunctionInput->InputType = InputTypeFor(Outside.Source, Copy, It.Index);
-					FunctionInput->SortPriority = OutsideInputs.Num() - 1;
+					FunctionInput->SortPriority = (Existing ? Existing->MaxInputPriority + 1 : 0) + OutsideInputs.Num() - 1;
 					FunctionInput->Description = TEXT("Wired from the material by Create Parameter Data Function.");
+					// Other materials already calling the function don't wire the new input; they don't read the new
+					// outputs either, so a default (the preview value) keeps them compiling
+					FunctionInput->bUsePreviewValueAsDefault = bAdd;
 					FunctionInputs.Add(FunctionInput);
 					Index = OutsideInputs.Num() - 1;
 				}
@@ -811,20 +1017,31 @@ namespace VrrParameterData
 			}
 		}
 
-		// 5c. Outputs "<Name> (Type)", top to bottom like their sources
+		// 5c. Outputs "<Name> (Type)", top to bottom like their sources; when adding, after the existing ones
 		Outputs.StableSort([](const FOutput& A, const FOutput& B) { return A.Source->MaterialExpressionEditorY < B.Source->MaterialExpressionEditorY; });
 		TMap<UMaterialExpression*, int32> OutputsPerSource;	// stack a node's outputs (e.g. R, G, A) instead of overlapping them
+		int32 NextPriority = Existing ? Existing->MaxOutputPriority + 1 : 0;
+		int32 NextReusedY = Existing ? Existing->BottomY + 250 : 0;	// new outputs of a node the function already had
 		for (int32 i = 0; i < Outputs.Num(); ++i)
 		{
 			FOutput& Output = Outputs[i];
+			if (Output.ExistingOutput)
+			{
+				continue;
+			}
 			UMaterialExpression* Copy = CopyOf[Output.Source];
-			const int32 OutputY = Copy->MaterialExpressionEditorY + OutputsPerSource.FindOrAdd(Output.Source)++ * 90;
+			int32 OutputY = Copy->MaterialExpressionEditorY + OutputsPerSource.FindOrAdd(Output.Source)++ * 90;
+			if (AlreadyInFunction.Contains(Output.Source))
+			{
+				OutputY = NextReusedY;	// its node sits up with the old outputs: keep the new one clear of them
+				NextReusedY += 90;
+			}
 			UMaterialExpression* From = Copy;
 			int32 FromPin = Output.SourcePin;
 			if (Output.bMaskRG)
 			{
 				UMaterialExpressionComponentMask* Mask = Cast<UMaterialExpressionComponentMask>(
-					UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionComponentMask::StaticClass(), -200, OutputY));
+					UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionComponentMask::StaticClass(), OutputX - 200, OutputY));
 				Mask->R = true;
 				Mask->G = true;
 				Mask->B = false;
@@ -834,10 +1051,10 @@ namespace VrrParameterData
 				FromPin = 0;
 			}
 			UMaterialExpressionFunctionOutput* FunctionOutput = Cast<UMaterialExpressionFunctionOutput>(
-				UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionFunctionOutput::StaticClass(), 0, OutputY));
+				UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionFunctionOutput::StaticClass(), OutputX, OutputY));
 			FunctionOutput->OutputName = FName(FString::Printf(TEXT("%s %s"), *Output.Name, Suffix(Output.Type)));
 			FunctionOutput->Description = Output.Source->Desc;
-			FunctionOutput->SortPriority = i;
+			FunctionOutput->SortPriority = NextPriority++;
 			FunctionOutput->A.Connect(FromPin, From);
 		}
 
@@ -846,17 +1063,27 @@ namespace VrrParameterData
 		UEditorLoadingAndSavingUtils::SavePackages({ Function->GetOutermost() }, false);
 
 		// 6. Rewire the material (the editor's working copy), as one undo step
+		UMaterialExpressionMaterialFunctionCall* Call = TargetCall;
 		{
-			const FScopedTransaction Transaction(LOCTEXT("Transaction", "Create Parameter Data Function"));
+			const FScopedTransaction Transaction(Tool);
 			Material->Modify();
 
-			// 6a. The call where the moved nodes were; its inputs read what the moved nodes used to read
-			UMaterialExpressionMaterialFunctionCall* Call = Cast<UMaterialExpressionMaterialFunctionCall>(
-				UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionMaterialFunctionCall::StaticClass(), Function, MinX, MinY, false));
-			if (!Call || Call->MaterialFunction != Function)
+			// 6a. The call: a new one where the moved nodes were, or the target call refreshed so it has the new pins
+			//     (existing links follow their pins by id). Its new inputs read what the moved nodes used to read.
+			if (bAdd)
 			{
-				Notify(LOCTEXT("CallFailed", "Create Parameter Data Function: couldn't place the function in the material. The function asset was created."), false);
-				return;
+				Call->Modify();
+				Call->UpdateFromFunctionResource();
+			}
+			else
+			{
+				Call = Cast<UMaterialExpressionMaterialFunctionCall>(
+					UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionMaterialFunctionCall::StaticClass(), Function, MinX, MinY, false));
+				if (!Call || Call->MaterialFunction != Function)
+				{
+					Fail(LOCTEXT("CallFailed", "couldn't place the function in the material. The function asset was created."));
+					return;
+				}
 			}
 			for (const FOutsideInput& Outside : OutsideInputs)
 			{
@@ -871,19 +1098,46 @@ namespace VrrParameterData
 				}
 			}
 
-			// 6b. One named reroute per output
-			const int32 DeclarationX = MinX + 450;
-			for (int32 i = 0; i < Outputs.Num(); ++i)
+			// 6b. One named reroute per output. When adding: a reused output keeps its reroute if it has one, and new
+			//     reroutes go under the call's existing ones.
+			TArray<UMaterialExpressionNamedRerouteDeclaration*> CallDeclarations;
+			for (UMaterialExpression* E : Material->GetExpressions())
 			{
-				FOutput& Output = Outputs[i];
+				UMaterialExpressionNamedRerouteDeclaration* Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(E);
+				if (Declaration && Declaration->Input.Expression == Call)
+				{
+					CallDeclarations.Add(Declaration);
+				}
+			}
+			int32 DeclarationX = MinX + 450;
+			int32 DeclarationY = MinY;
+			if (bAdd)
+			{
+				DeclarationX = Call->MaterialExpressionEditorX + 450;
+				DeclarationY = Call->MaterialExpressionEditorY;
+				for (const UMaterialExpressionNamedRerouteDeclaration* Declaration : CallDeclarations)
+				{
+					DeclarationX = Declaration->MaterialExpressionEditorX;
+					DeclarationY = FMath::Max(DeclarationY, Declaration->MaterialExpressionEditorY + 64);
+				}
+			}
+			for (FOutput& Output : Outputs)
+			{
 				const FName OutputName(FString::Printf(TEXT("%s %s"), *Output.Name, Suffix(Output.Type)));
 				const int32 CallPin = Call->GetOutputs().IndexOfByPredicate([&OutputName](const FExpressionOutput& O) { return O.OutputName == OutputName; });
 				if (CallPin == INDEX_NONE)
 				{
 					continue;
 				}
+				if (UMaterialExpressionNamedRerouteDeclaration** Found = CallDeclarations.FindByPredicate(
+					[CallPin](const UMaterialExpressionNamedRerouteDeclaration* D) { return D->Input.OutputIndex == CallPin; }))
+				{
+					Output.Declaration = *Found;
+					continue;
+				}
 				Output.Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(
-					UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionNamedRerouteDeclaration::StaticClass(), nullptr, DeclarationX, MinY + i * 64, false));
+					UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionNamedRerouteDeclaration::StaticClass(), nullptr, DeclarationX, DeclarationY, false));
+				DeclarationY += 64;
 				Output.Declaration->Input.Connect(CallPin, Call);
 				Output.Declaration->NodeColor = TypeColor(Output.Type);
 				Output.Declaration->SetEditableName(FString::Printf(TEXT("%s%s"), Prefix(Output.Type), *Output.Name));	// made unique if taken
@@ -933,13 +1187,45 @@ namespace VrrParameterData
 		Graph->RebuildGraph();
 		Editor->UpdateMaterialAfterGraphChange();
 
-		FText Message = FText::Format(LOCTEXT("Done", "Moved {0} node(s) into {1}: {2} output(s), {3} input(s)."),
-			Moved.Num(), FText::FromString(AssetName), Outputs.Num(), OutsideInputs.Num());
+		// 7a. Select the call and its named reroute declarations (not the usages), so they can be moved as one block
+		TSet<const UEdGraphNode*> ToSelect;
+		if (Call->GraphNode)
+		{
+			ToSelect.Add(Call->GraphNode);
+		}
+		for (UMaterialExpression* E : Material->GetExpressions())
+		{
+			const UMaterialExpressionNamedRerouteDeclaration* Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(E);
+			if (Declaration && Declaration->Input.Expression == Call && Declaration->GraphNode)
+			{
+				ToSelect.Add(Declaration->GraphNode);
+			}
+		}
+		Graph->SelectNodeSet(ToSelect);	// replaces the current selection
+
+		FText Message = bAdd
+			? FText::Format(LOCTEXT("DoneAdd", "Added {0} node(s) to {1}: {2} new output(s), {3} existing output(s) reused, {4} new input(s)."),
+				Moved.Num(), FText::FromString(AssetName), Outputs.Num() - ReusedOutputs, ReusedOutputs, OutsideInputs.Num())
+			: FText::Format(LOCTEXT("Done", "Moved {0} node(s) into {1}: {2} output(s), {3} input(s)."),
+				Moved.Num(), FText::FromString(AssetName), Outputs.Num(), OutsideInputs.Num());
 		if (!Skipped.IsEmpty())
 		{
 			Message = FText::Format(LOCTEXT("DoneSkipped", "{0}\nSkipped: {1}"), Message, FText::FromString(FString::Join(Skipped, TEXT(", "))));
 		}
 		Notify(Message, true);
+	}
+
+	void CreateFromSelection(UMaterialGraph* Graph)
+	{
+		Run(Graph, nullptr);
+	}
+
+	void AddToFunction(UMaterialGraph* Graph, UMaterialExpressionMaterialFunctionCall* Call)
+	{
+		if (Call)
+		{
+			Run(Graph, Call);
+		}
 	}
 }
 
