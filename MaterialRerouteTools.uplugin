@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Material Reroute Tools",
+	"Description": "Material editor tools: typed, color-coded named reroutes (drag off any pin), organize parameters and material inputs into named reroutes, and build parameter data functions.",
+	"Category": "Editor",
+	"CreatedBy": "Robotica",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"FabURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "MaterialRerouteTools",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [ "Win64", "Mac", "Linux" ]
+		}
+	]
+}

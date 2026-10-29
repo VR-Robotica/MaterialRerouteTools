@@ -1,9 +1,9 @@
 using UnrealBuildTool;
 
-/** Editor-only tools for VRR_Materials (material graph context menu actions). Never ships with the game. */
-public class VRR_MaterialsEditor : ModuleRules
+/** Material Reroute Tools: editor-only material graph context menu actions. Never ships with the game. */
+public class MaterialRerouteTools : ModuleRules
 {
-	public VRR_MaterialsEditor(ReadOnlyTargetRules Target) : base(Target)
+	public MaterialRerouteTools(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 

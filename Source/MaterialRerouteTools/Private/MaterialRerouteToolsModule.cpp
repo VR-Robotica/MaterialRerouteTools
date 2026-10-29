@@ -1,5 +1,5 @@
 /*
- * VRR_MaterialsEditor: editor-only tools for VRR_Materials, in a "VRR" section of the material graph's right-click
+ * MaterialRerouteTools: editor-only material graph tools, in a "VRR" section of the material graph's right-click
  * menus (materials only, not material functions):
  *
  *   Expression nodes, when the selection has parameters:
@@ -26,7 +26,7 @@
 #include "Vrr_OrganizeParameters.h"
 #include "Vrr_ParameterDataFunction.h"
 
-#define LOCTEXT_NAMESPACE "VRR_MaterialsEditor"
+#define LOCTEXT_NAMESPACE "MaterialRerouteTools"
 
 namespace
 {
@@ -154,12 +154,12 @@ namespace
 	}
 }
 
-class FVRR_MaterialsEditorModule : public IModuleInterface
+class FMaterialRerouteToolsModule : public IModuleInterface
 {
 public:
 	virtual void StartupModule() override
 	{
-		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FVRR_MaterialsEditorModule::RegisterMenus));
+		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FMaterialRerouteToolsModule::RegisterMenus));
 	}
 
 	virtual void ShutdownModule() override
@@ -181,6 +181,6 @@ private:
 	}
 };
 
-IMPLEMENT_MODULE(FVRR_MaterialsEditorModule, VRR_MaterialsEditor)
+IMPLEMENT_MODULE(FMaterialRerouteToolsModule, MaterialRerouteTools)
 
 #undef LOCTEXT_NAMESPACE
