@@ -12,6 +12,7 @@ public class VRR_MaterialsEditor : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			"RenderCore",		// Substrate checks behind the Result node's visible pins
 			"UnrealEd",			// UMaterialGraph, factories, saving, transactions
 			"MaterialEditor",	// IMaterialEditor, FMaterialEditorUtilities, UMaterialEditingLibrary
 			"ToolMenus",		// graph context menu extension

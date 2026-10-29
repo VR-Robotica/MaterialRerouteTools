@@ -47,14 +47,17 @@
  *     when adding, use the target function (parameters it already has stand in for their copies, step 3').
  *  5. Build the function: copies of the moved nodes (relinked to each other), function inputs for outside links,
  *     outputs "<Name> (S|V2|V3|V4)", then save it.
- *  6. In the material: add the call or refresh the target call (new inputs wired to the original sources), a named reroute
- *     "s_|vec2_|vec3_|vec4_<Name>" per output, a reroute usage next to every read, then delete the moved nodes.
+ *  6. In the material: add the call or refresh the target call (new inputs wired to the original sources), a named
+ *     reroute "s_|vec2_|vec3_|vec4_<Name>" per output (named and colored as in Vrr_RerouteStyle), a usage next to
+ *     every read, then delete the moved nodes.
  *  7. Rebuild the graph, tell the material editor it changed, and select the call and its named reroute declarations.
  *
  * Each step is one method of FRun below, which holds the state the steps share.
  */
 
 #include "Vrr_ParameterDataFunction.h"
+#include "Vrr_MaterialGraphUtils.h"
+#include "Vrr_RerouteStyle.h"
 
 #include "AssetToolsModule.h"
 #include "ContentBrowserModule.h"
@@ -62,12 +65,9 @@
 #include "IContentBrowserSingleton.h"
 #include "Factories/MaterialFunctionFactoryNew.h"
 #include "FileHelpers.h"
-#include "Framework/Notifications/NotificationManager.h"
 #include "IMaterialEditor.h"
 #include "MaterialEditingLibrary.h"
-#include "MaterialEditorUtilities.h"
 #include "MaterialGraph/MaterialGraph.h"
-#include "MaterialGraph/MaterialGraphNode.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialFunction.h"
 #include "Materials/MaterialExpressionAntialiasedTextureMask.h"
@@ -86,7 +86,6 @@
 #include "Misc/PackageName.h"
 #include "ScopedTransaction.h"
 #include "Subsystems/AssetEditorSubsystem.h"
-#include "Widgets/Notifications/SNotificationList.h"
 
 #define LOCTEXT_NAMESPACE "VrrParameterData"
 
@@ -98,12 +97,7 @@ namespace VrrParameterData
 	constexpr uint8 ChR = 1, ChG = 2, ChB = 4, ChA = 8;
 	constexpr int32 PinRGB = 0, PinRGBA = 5;
 
-	/** One place that reads a node: an expression input, or one of the material's own outputs (Consumer null). */
-	struct FLink
-	{
-		UMaterialExpression* Consumer = nullptr;
-		FExpressionInput* Input = nullptr;
-	};
+	using VrrGraph::FLink;
 
 	/** One function output: the moved node it reads, how, and every outside read that now goes through it. */
 	struct FOutput
@@ -137,26 +131,14 @@ namespace VrrParameterData
 		}
 	}
 
-	const TCHAR* Prefix(EType Type)
+	VrrReroute::EKind ToKind(EType Type)
 	{
 		switch (Type)
 		{
-		case EType::V2: return TEXT("vec2_");
-		case EType::V3: return TEXT("vec3_");
-		case EType::V4: return TEXT("vec4_");
-		default:        return TEXT("s_");
-		}
-	}
-
-	/** Reroute colors per type, so the type reads at a glance in the graph. */
-	FLinearColor TypeColor(EType Type)
-	{
-		switch (Type)
-		{
-		case EType::V2: return FLinearColor(1.0f, 0.8f, 0.0f);
-		case EType::V3: return FLinearColor(0.5f, 1.0f, 0.0f);
-		case EType::V4: return FLinearColor(1.0f, 0.0f, 0.82f);
-		default:        return FLinearColor(0.2f, 0.6f, 1.0f);
+		case EType::V2: return VrrReroute::EKind::Vector2;
+		case EType::V3: return VrrReroute::EKind::Vector3;
+		case EType::V4: return VrrReroute::EKind::Vector4;
+		default:        return VrrReroute::EKind::Scalar;
 		}
 	}
 
@@ -231,34 +213,6 @@ namespace VrrParameterData
 		return PinBits;
 	}
 
-	/** Custom channel names (Parameter Customization) of a vector parameter or texture sample; a plain sampler with
-	 *  none of its own uses its texture object parameter's. */
-	FParameterChannelNames ChannelNamesOf(const UMaterialExpression* E)
-	{
-		auto HasAny = [](const FParameterChannelNames& N) { return !N.R.IsEmpty() || !N.G.IsEmpty() || !N.B.IsEmpty() || !N.A.IsEmpty(); };
-		if (const UMaterialExpressionVectorParameter* Vector = Cast<UMaterialExpressionVectorParameter>(E))
-		{
-			return Vector->ChannelNames;
-		}
-		if (const UMaterialExpressionTextureSample* Sample = Cast<UMaterialExpressionTextureSample>(E))
-		{
-			if (!HasAny(Sample->ChannelNames) && IsPlainSampler(E))
-			{
-				if (const UMaterialExpressionTextureSample* Object = Cast<UMaterialExpressionTextureSample>(Sample->TextureObject.Expression))
-				{
-					return Object->ChannelNames;
-				}
-			}
-			return Sample->ChannelNames;
-		}
-		return FParameterChannelNames();
-	}
-
-	int32 MaskWidth(const FExpressionInput& Input)
-	{
-		return (Input.MaskR ? 1 : 0) + (Input.MaskG ? 1 : 0) + (Input.MaskB ? 1 : 0) + (Input.MaskA ? 1 : 0);
-	}
-
 	/** Components a link carries: its mask if it has one, else what the source pin gives (0 = unknown). */
 	int32 LinkWidth(const FExpressionInput& Input);
 
@@ -285,7 +239,7 @@ namespace VrrParameterData
 		{
 			return 0;
 		}
-		return Input.Mask ? MaskWidth(Input) : PinWidth(Input.Expression, Input.OutputIndex);
+		return Input.Mask ? VrrGraph::MaskWidth(Input) : PinWidth(Input.Expression, Input.OutputIndex);
 	}
 
 	/** Function input type for a link from outside: from its mask / the source's output type, else the input's own type. */
@@ -315,7 +269,7 @@ namespace VrrParameterData
 		EFunctionInputType Result = FunctionInput_Vector4;
 		if (Source.Mask)
 		{
-			const int32 Width = MaskWidth(Source);
+			const int32 Width = VrrGraph::MaskWidth(Source);
 			return Width <= 1 ? FunctionInput_Scalar : Width == 2 ? FunctionInput_Vector2 : Width == 3 ? FunctionInput_Vector3 : FunctionInput_Vector4;
 		}
 		if (FromValueType(Source.Expression->GetOutputValueType(Source.OutputIndex), Result))
@@ -329,43 +283,12 @@ namespace VrrParameterData
 		return FunctionInput_Vector4;
 	}
 
-	TSharedPtr<IMaterialEditor> GetEditor(const UMaterialGraph* Graph)
-	{
-		return FMaterialEditorUtilities::GetIMaterialEditorForObject(Graph);
-	}
-
 	/** Marker written into the Description of functions this tool creates. */
 	const TCHAR* const MadeByTool = TEXT("(Create Parameter Data Function)");
 
-	void Notify(const FText& Message, bool bSuccess)
-	{
-		FNotificationInfo Info(Message);
-		Info.ExpireDuration = bSuccess ? 6.0f : 10.0f;
-		Info.bUseSuccessFailIcons = true;
-		if (TSharedPtr<SNotificationItem> Item = FSlateNotificationManager::Get().AddNotification(Info))
-		{
-			Item->SetCompletionState(bSuccess ? SNotificationItem::CS_Success : SNotificationItem::CS_Fail);
-		}
-	}
-
 	TArray<UMaterialExpression*> GetSelectedParameters(const UMaterialGraph* Graph)
 	{
-		TArray<UMaterialExpression*> Result;
-		const TSharedPtr<IMaterialEditor> Editor = GetEditor(Graph);
-		if (!Editor.IsValid())
-		{
-			return Result;
-		}
-		for (UObject* Selected : Editor->GetSelectedNodes())
-		{
-			const UMaterialGraphNode* Node = Cast<UMaterialGraphNode>(Selected);
-			UMaterialExpression* Expression = Node ? Node->MaterialExpression.Get() : nullptr;
-			if (Expression && IsSelectableParameter(Expression))
-			{
-				Result.Add(Expression);
-			}
-		}
-		return Result;
+		return VrrGraph::GetSelectedExpressions(Graph, IsSelectableParameter);
 	}
 
 	TArray<UMaterialExpressionMaterialFunctionCall*> GetParameterDataCalls(const UMaterialGraph* Graph)
@@ -518,12 +441,6 @@ namespace VrrParameterData
 		}
 	};
 
-	/** Top to bottom, then left to right, as nodes sit in the graph. */
-	bool ByPosition(const UMaterialExpression& A, const UMaterialExpression& B)
-	{
-		return A.MaterialExpressionEditorY != B.MaterialExpressionEditorY ? A.MaterialExpressionEditorY < B.MaterialExpressionEditorY : A.MaterialExpressionEditorX < B.MaterialExpressionEditorX;
-	}
-
 	/** Name a moved parameter goes by: a plain sampler's texture object's, else its own parameter name. */
 	FString ParameterNameOf(const UMaterialExpression* E)
 	{
@@ -575,7 +492,7 @@ namespace VrrParameterData
 
 		// 1. Selection and who reads what
 		TArray<UMaterialExpression*> Selected;
-		TMap<UMaterialExpression*, TArray<FLink>> Readers;
+		VrrGraph::FReaders Readers;
 
 		// 2. Moved set
 		TArray<UMaterialExpression*> Moved;
@@ -609,7 +526,6 @@ namespace VrrParameterData
 
 		bool CheckTarget();							// 0
 		bool CollectSelection();					// 1
-		void MapReaders();							// 1
 		bool GrowMovedSet();						// 2
 		void AddTextureObject(UMaterialExpression* Parameter);	// 2a
 		bool MergeSameNamed();						// 3, 3'
@@ -630,7 +546,7 @@ namespace VrrParameterData
 	FRun::FRun(UMaterialGraph* InGraph, UMaterialExpressionMaterialFunctionCall* InTargetCall)
 		: Graph(InGraph)
 		, Material(InGraph ? InGraph->Material.Get() : nullptr)
-		, Editor(GetEditor(InGraph))
+		, Editor(VrrGraph::GetEditor(InGraph))
 		, TargetCall(InTargetCall)
 		, bAdd(InTargetCall != nullptr)
 		, Tool(InTargetCall ? LOCTEXT("AddTool", "Add to Parameter Data Function") : LOCTEXT("CreateTool", "Create Parameter Data Function"))
@@ -663,7 +579,7 @@ namespace VrrParameterData
 
 	void FRun::Fail(const FText& Message) const
 	{
-		Notify(FText::Format(LOCTEXT("Fail", "{0}: {1}"), Tool, Message), false);
+		VrrGraph::Notify(FText::Format(LOCTEXT("Fail", "{0}: {1}"), Tool, Message), false);
 	}
 
 	const TArray<FLink>& FRun::ReadersOf(UMaterialExpression* E) const
@@ -736,40 +652,9 @@ namespace VrrParameterData
 			Fail(LOCTEXT("NothingSelected", "select parameters first."));
 			return false;
 		}
-		Selected.Sort(ByPosition);
-		MapReaders();
+		Selected.Sort(VrrGraph::ByPosition);
+		Readers = VrrGraph::MapReaders(Material);
 		return true;
-	}
-
-	void FRun::MapReaders()
-	{
-		for (UMaterialExpression* Expression : Material->GetExpressions())
-		{
-			if (!Expression)
-			{
-				continue;
-			}
-			for (FExpressionInputIterator It{ Expression }; It; ++It)
-			{
-				if (It.Input->Expression)
-				{
-					Readers.FindOrAdd(It.Input->Expression).Add({ Expression, It.Input });
-				}
-			}
-		}
-
-		// The material's own outputs, hidden ones too (legacy pins while Substrate is on can still hold a link)
-		TSet<FExpressionInput*> Seen;
-		for (int32 Property = 0; Property < MP_MAX; ++Property)
-		{
-			FMaterialInputDescription Description;
-			FExpressionInput* Input = Material->GetExpressionInputDescription(static_cast<EMaterialProperty>(Property), Description) ? Description.Input : nullptr;
-			if (Input && Input->Expression && !Seen.Contains(Input))
-			{
-				Seen.Add(Input);
-				Readers.FindOrAdd(Input->Expression).Add({ nullptr, Input });
-			}
-		}
 	}
 
 	// 2. Moved set: the parameters, texture samples of selected texture objects, then appends of moved values
@@ -835,7 +720,7 @@ namespace VrrParameterData
 			return;
 		}
 		AddMoved(Parameter);
-		Samplers.Sort(ByPosition);
+		Samplers.Sort(VrrGraph::ByPosition);
 		for (UMaterialExpression* Sampler : Samplers)
 		{
 			AddMoved(Sampler);
@@ -1004,16 +889,11 @@ namespace VrrParameterData
 				AddOutput(E, BaseName, EType::V2, PinRGB, WholeReads).bMaskRG = true;
 			}
 		}
-		const FParameterChannelNames CustomNames = ChannelNamesOf(E);
-		const FText* Custom[4] = { &CustomNames.R, &CustomNames.G, &CustomNames.B, &CustomNames.A };
-		static const TCHAR* Letters[4] = { TEXT("R"), TEXT("G"), TEXT("B"), TEXT("A") };
 		for (int32 Channel = 0; Channel < 4; ++Channel)
 		{
 			if (!ChannelReads[Channel].IsEmpty())
 			{
-				const FString CustomName = Custom[Channel]->ToString().TrimStartAndEnd();
-				const FString Name = CustomName.IsEmpty() ? FString::Printf(TEXT("%s %s"), *BaseName, Letters[Channel]) : CustomName;
-				AddOutput(E, Name, EType::S, Channel + 1, ChannelReads[Channel]).bClearReadMasks = true;
+				AddOutput(E, VrrGraph::ChannelName(E, BaseName, Channel), EType::S, Channel + 1, ChannelReads[Channel]).bClearReadMasks = true;
 			}
 		}
 	}
@@ -1280,16 +1160,18 @@ namespace VrrParameterData
 				CallDeclarations.Add(Declaration);
 			}
 		}
-		int32 DeclarationX = MinX + 450;
+		constexpr int32 DeclarationOffset = 450;	// right of the call (function calls are wide)
+		constexpr int32 DeclarationStep = 64;
+		int32 DeclarationX = MinX + DeclarationOffset;
 		int32 DeclarationY = MinY;
 		if (bAdd)
 		{
-			DeclarationX = Call->MaterialExpressionEditorX + 450;
+			DeclarationX = Call->MaterialExpressionEditorX + DeclarationOffset;
 			DeclarationY = Call->MaterialExpressionEditorY;
 			for (const UMaterialExpressionNamedRerouteDeclaration* Declaration : CallDeclarations)
 			{
 				DeclarationX = Declaration->MaterialExpressionEditorX;
-				DeclarationY = FMath::Max(DeclarationY, Declaration->MaterialExpressionEditorY + 64);
+				DeclarationY = FMath::Max(DeclarationY, Declaration->MaterialExpressionEditorY + DeclarationStep);
 			}
 		}
 		for (FOutput& Output : Outputs)
@@ -1306,12 +1188,15 @@ namespace VrrParameterData
 				Output.Declaration = *Found;
 				continue;
 			}
-			Output.Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(
-				UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionNamedRerouteDeclaration::StaticClass(), nullptr, DeclarationX, DeclarationY, false));
-			DeclarationY += 64;
-			Output.Declaration->Input.Connect(CallPin, Call);
-			Output.Declaration->NodeColor = TypeColor(Output.Type);
-			Output.Declaration->SetEditableName(FString::Printf(TEXT("%s%s"), Prefix(Output.Type), *Output.Name));	// made unique if taken
+			// Booleans and textures by value, everything else by the output's type
+			VrrReroute::EKind Kind = VrrReroute::KindOf(Output.Source, Output.SourcePin);
+			if (Kind != VrrReroute::EKind::Bool && Kind != VrrReroute::EKind::Texture)
+			{
+				Kind = ToKind(Output.Type);
+			}
+			Output.Declaration = VrrGraph::CreateDeclaration(Material, Call, CallPin, DeclarationX, DeclarationY,
+				FString::Printf(TEXT("%s%s"), VrrReroute::Prefix(Kind), *Output.Name), VrrReroute::ColorFor(Output.Source, Output.SourcePin, Kind));
+			DeclarationY += DeclarationStep;
 		}
 	}
 
@@ -1328,20 +1213,12 @@ namespace VrrParameterData
 			for (const FLink& Read : Output.Reads)
 			{
 				const int32 Slot = UsagesPerConsumer.FindOrAdd(Read.Consumer)++;
-				const int32 X = (Read.Consumer ? Read.Consumer->MaterialExpressionEditorX : Material->EditorX) - 300;
-				const int32 Y = (Read.Consumer ? Read.Consumer->MaterialExpressionEditorY : Material->EditorY) + Slot * 48;
-
-				UMaterialExpressionNamedRerouteUsage* Usage = Cast<UMaterialExpressionNamedRerouteUsage>(
-					UMaterialEditingLibrary::CreateMaterialExpressionEx(Material, nullptr, UMaterialExpressionNamedRerouteUsage::StaticClass(), nullptr, X, Y, false));
-				Usage->Declaration = Output.Declaration;
-				Usage->DeclarationGuid = Output.Declaration->VariableGuid;
-
-				if (Read.Consumer)
+				UMaterialExpressionNamedRerouteUsage* Usage = VrrGraph::CreateUsage(Material, Output.Declaration, VrrGraph::UsagePositionFor(Material, Read.Consumer, Slot));
+				if (!Usage)
 				{
-					Read.Consumer->Modify();
+					continue;
 				}
-				Read.Input->Expression = Usage;
-				Read.Input->OutputIndex = 0;
+				VrrGraph::Rewire(Read, Usage);
 				if (Output.bClearReadMasks)
 				{
 					Read.Input->SetMask(0, 0, 0, 0, 0);
@@ -1353,24 +1230,17 @@ namespace VrrParameterData
 	// 7. Show the new nodes, mark the material as changed (Apply / Save as usual) and report
 	void FRun::Finish()
 	{
-		Graph->RebuildGraph();
-		Editor->UpdateMaterialAfterGraphChange();
-
 		// 7a. Select the call and its named reroute declarations (not the usages), so they can be moved as one block
-		TSet<const UEdGraphNode*> ToSelect;
-		if (Call->GraphNode)
-		{
-			ToSelect.Add(Call->GraphNode);
-		}
+		TArray<const UMaterialExpression*> ToSelect = { Call };
 		for (UMaterialExpression* E : Material->GetExpressions())
 		{
 			const UMaterialExpressionNamedRerouteDeclaration* Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(E);
-			if (Declaration && Declaration->Input.Expression == Call && Declaration->GraphNode)
+			if (Declaration && Declaration->Input.Expression == Call)
 			{
-				ToSelect.Add(Declaration->GraphNode);
+				ToSelect.Add(Declaration);
 			}
 		}
-		Graph->SelectNodeSet(ToSelect);	// replaces the current selection
+		VrrGraph::FinishEdit(Graph, *Editor, ToSelect);
 
 		FText Message = bAdd
 			? FText::Format(LOCTEXT("DoneAdd", "Added {0} node(s) to {1}: {2} new output(s), {3} existing output(s) reused, {4} new input(s)."),
@@ -1381,7 +1251,7 @@ namespace VrrParameterData
 		{
 			Message = FText::Format(LOCTEXT("DoneSkipped", "{0}\nSkipped: {1}"), Message, FText::FromString(FString::Join(Skipped, TEXT(", "))));
 		}
-		Notify(Message, true);
+		VrrGraph::Notify(Message, true);
 	}
 
 	void CreateFromSelection(UMaterialGraph* Graph)
