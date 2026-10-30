@@ -4,7 +4,7 @@ Editor tools for Unreal Engine's material editor that keep big material graphs r
 reroute** whose name prefix and color say its type at a glance, and whole groups of parameters or inputs can be
 organized in one click. Editor only: nothing ships with your game.
 
-Supported engine: **5.8**. Platforms: Windows, macOS, Linux (editor).
+Supported engines: **5.6, 5.7, 5.8**. Platforms: Windows, macOS, Linux (editor).
 
 ## Type prefixes and colors
 

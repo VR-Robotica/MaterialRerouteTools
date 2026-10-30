@@ -1,10 +1,11 @@
 # Copyright VR Robotica. All Rights Reserved.
 
 """
-Fab upload zip of the plugin's last commit for one engine version.
+Fab upload zips of the plugin's last commit, one per engine version.
 
-    python Scripts/fab_zip.py <engine version> [out.zip]
-    python Scripts/fab_zip.py 5.6                     -> MaterialRerouteTools_5.6.zip on the desktop
+    python Scripts/fab_zip.py                         -> a zip for every version in VERSIONS, on the desktop
+    python Scripts/fab_zip.py 5.6 5.7                 -> MaterialRerouteTools_5.6.zip and _5.7.zip on the desktop
+    python Scripts/fab_zip.py 5.6 out.zip             -> one version to a chosen path
 
 Zips the committed uplugin, README, Config, Resources and Source (not the working copy, and never Binaries,
 Intermediate or this folder) into one MaterialRerouteTools/ folder with forward-slash paths, sets the uplugin's
@@ -17,6 +18,7 @@ import zipfile
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))	# the folder above Scripts/
 SHIPPED = ['MaterialRerouteTools.uplugin', 'README.md', 'Config', 'Resources', 'Source']
+VERSIONS = ['5.6', '5.7', '5.8']	# engine versions the plugin is built and tested on
 
 
 def git(*args):
@@ -24,14 +26,24 @@ def git(*args):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = sys.argv[1:]
+    if any(a in ('-h', '--help') for a in args):
         sys.exit(__doc__)
-    version = sys.argv[1]
-    out = sys.argv[2] if len(sys.argv) > 2 else os.path.join(desktop(), 'MaterialRerouteTools_%s.zip' % version)
+    if len(args) == 2 and args[1].endswith('.zip'):
+        jobs = [(args[0], args[1])]
+    else:
+        jobs = [(v, os.path.join(desktop(), 'MaterialRerouteTools_%s.zip' % v)) for v in (args or VERSIONS)]
+    for version, _ in jobs:
+        if version.count('.') != 1 or not version.replace('.', '').isdigit():
+            sys.exit('error: "%s" is not an engine version like 5.7' % version)
 
     if git('status', '--porcelain', '--', *SHIPPED).strip():
-        print('warning: uncommitted changes in the shipped files are not in the zip')
+        print('warning: uncommitted changes in the shipped files are not in the zips')
+    for version, out in jobs:
+        make_zip(version, out)
 
+
+def make_zip(version, out):
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
         for f in git('ls-files', '--', *SHIPPED).decode().split():
             data = git('show', 'HEAD:' + f)
