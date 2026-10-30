@@ -10,8 +10,9 @@ struct FExpressionInput;
 namespace UE::Shader { enum class EValueType : uint8; }
 
 /**
- * Shared naming and color rules for the named reroutes the VRR material tools create, so a value's type reads at a
- * glance in the graph:
+ * Shared naming and color rules for the named reroutes the tools create, so a value's type reads at a glance in the
+ * graph. Prefixes and colors are project settings (UVrrRerouteSettings, Project Settings > Plugins > Material Reroute
+ * Tools); the defaults are:
  *
  *   Boolean b_ red, Scalar s_ green, Vector2 vec2_ yellow green, Vector3 vec3_ yellow, Vector4 vec4_ orange,
  *   Texture Object tex_ blue, Material Attributes ma_ purple, Shading Model sm_ teal, and the RGB pin of a
@@ -68,10 +69,10 @@ namespace VrrReroute
 	/** Width (1-4) to kind; anything else is Unknown. */
 	EKind KindForWidth(int32 Width);
 
-	/** Named reroute name prefix: "b_", "s_", "vec2_", "vec3_", "vec4_", "tex_", "ma_", "sm_" (none for Unknown). */
+	/** Named reroute name prefix from the project settings (default "b_", "s_", "vec2_", ...; none for Unknown). */
 	const TCHAR* Prefix(EKind Kind);
 
-	/** Color per kind (Unknown gets a neutral grey). */
+	/** Color per kind from the project settings (Unknown gets the Unknown Type Color, grey by default). */
 	FLinearColor Color(EKind Kind);
 
 	/** Texture sample set to sample a normal map (a plain sampler also counts if its texture object does). */

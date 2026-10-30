@@ -20,6 +20,7 @@ public class MaterialRerouteTools : ModuleRules
 			"ToolMenus",		// graph context menu extension
 			"AssetTools",		// creating the material function asset
 			"ContentBrowser",	// save asset dialog
+			"DeveloperSettings",	// Project Settings page for prefixes and colors
 			"Slate",
 			"SlateCore"
 		});

@@ -10,6 +10,7 @@
 
 #include "Vrr_RerouteStyle.h"
 #include "Vrr_MaterialGraphUtils.h"
+#include "Vrr_RerouteSettings.h"
 
 #include "Algo/AllOf.h"
 #include "MaterialDomain.h"
@@ -494,17 +495,20 @@ namespace VrrReroute
 			return Channel == INDEX_NONE ? Base : VrrGraph::ChannelName(Source, Base, Channel);
 		}
 
-		/** A named reroute's name without its type prefix: "vec3_Normal" -> "Normal". */
+		/** A named reroute's name without its type prefix: "vec3_Normal" -> "Normal" (the longest prefix that fits). */
 		FString WithoutPrefix(const FString& Name)
 		{
+			int32 Longest = 0;
 			for (EKind Kind : { EKind::Bool, EKind::Scalar, EKind::Vector2, EKind::Vector3, EKind::Vector4, EKind::Texture, EKind::MaterialAttributes, EKind::ShadingModel })
 			{
-				if (Name.StartsWith(Prefix(Kind), ESearchCase::CaseSensitive))
+				const TCHAR* KindPrefix = Prefix(Kind);
+				const int32 Length = FCString::Strlen(KindPrefix);
+				if (Length > Longest && Name.StartsWith(KindPrefix, ESearchCase::CaseSensitive))
 				{
-					return Name.RightChop(FCString::Strlen(Prefix(Kind)));
+					Longest = Length;
 				}
 			}
-			return Name;
+			return Name.RightChop(Longest);
 		}
 
 		/** Name of the value a link carries, through reroutes and named reroutes (the reroute's name, prefix dropped). */
@@ -577,36 +581,37 @@ namespace VrrReroute
 		return FInfer().Link(Link);
 	}
 
+	namespace
+	{
+		/** The project's style for a kind (Project Settings > Plugins > Material Reroute Tools), null for Unknown. */
+		const FVrrRerouteStyle* StyleOf(EKind Kind)
+		{
+			const UVrrRerouteSettings& Settings = UVrrRerouteSettings::Get();
+			switch (Kind)
+			{
+			case EKind::Bool:               return &Settings.Bool;
+			case EKind::Scalar:             return &Settings.Scalar;
+			case EKind::Vector2:            return &Settings.Vector2;
+			case EKind::Vector3:            return &Settings.Vector3;
+			case EKind::Vector4:            return &Settings.Vector4;
+			case EKind::Texture:            return &Settings.Texture;
+			case EKind::MaterialAttributes: return &Settings.MaterialAttributes;
+			case EKind::ShadingModel:       return &Settings.ShadingModel;
+			default:                        return nullptr;
+			}
+		}
+	}
+
 	const TCHAR* Prefix(EKind Kind)
 	{
-		switch (Kind)
-		{
-		case EKind::Bool:    return TEXT("b_");
-		case EKind::Scalar:  return TEXT("s_");
-		case EKind::Vector2: return TEXT("vec2_");
-		case EKind::Vector3: return TEXT("vec3_");
-		case EKind::Vector4: return TEXT("vec4_");
-		case EKind::Texture: return TEXT("tex_");
-		case EKind::MaterialAttributes: return TEXT("ma_");
-		case EKind::ShadingModel:       return TEXT("sm_");
-		default:             return TEXT("");
-		}
+		const FVrrRerouteStyle* Style = StyleOf(Kind);
+		return Style ? *Style->Prefix : TEXT("");
 	}
 
 	FLinearColor Color(EKind Kind)
 	{
-		switch (Kind)
-		{
-		case EKind::Bool:    return FLinearColor(1.0f, 0.0f, 0.0f);	// red
-		case EKind::Scalar:  return FLinearColor(0.0f, 1.0f, 0.0f);	// green
-		case EKind::Vector2: return FLinearColor(0.6f, 1.0f, 0.0f);	// yellow green
-		case EKind::Vector3: return FLinearColor(1.0f, 1.0f, 0.0f);	// yellow
-		case EKind::Vector4: return FLinearColor(1.0f, 0.5f, 0.0f);	// orange
-		case EKind::Texture: return FLinearColor(0.0f, 0.0f, 1.0f);	// blue
-		case EKind::MaterialAttributes: return FLinearColor(0.5f, 0.0f, 1.0f);	// purple
-		case EKind::ShadingModel:       return FLinearColor(0.0f, 0.5f, 0.5f);	// teal
-		default:             return FLinearColor(0.5f, 0.5f, 0.5f);
-		}
+		const FVrrRerouteStyle* Style = StyleOf(Kind);
+		return Style ? Style->Color : UVrrRerouteSettings::Get().UnknownColor;
 	}
 
 	bool IsNormalSampler(const UMaterialExpression* E)
@@ -629,7 +634,7 @@ namespace VrrReroute
 	{
 		if (Pin == 0 && WidthOf(Kind) > 0 && IsNormalSampler(Source))
 		{
-			return FLinearColor(0.5f, 0.5f, 1.0f);	// RGB of a normal map
+			return UVrrRerouteSettings::Get().NormalMapColor;	// RGB of a normal map
 		}
 		return Color(Kind);
 	}

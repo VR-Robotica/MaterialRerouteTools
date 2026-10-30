@@ -1,7 +1,7 @@
 // Copyright VR Robotica. All Rights Reserved.
 
 /*
- * MaterialRerouteTools: editor-only material graph tools, in a "VRR" section of the material graph's right-click
+ * MaterialRerouteTools: editor-only material graph tools, in a "Material Reroute Tools" section of the material graph's right-click
  * menus (materials only, not material functions):
  *
  *   Expression nodes, when the selection has parameters:
@@ -43,7 +43,7 @@ namespace
 
 	FToolMenuSection& VrrSection(UToolMenu* Menu)
 	{
-		return Menu->AddSection(SectionName, LOCTEXT("SectionLabel", "VRR"));	// finds it if already added
+		return Menu->AddSection(SectionName, LOCTEXT("SectionLabel", "Material Reroute Tools"));	// finds it if already added
 	}
 
 	/** Runs Action on the graph if it's still around when the entry is clicked. */
@@ -97,7 +97,7 @@ namespace
 				LOCTEXT("OrganizeLabel", "Organize Parameters into Named Reroutes"),
 				FText::Format(LOCTEXT("OrganizeTooltip",
 					"Gather the {0} selected parameter(s) into a column at the top left of the graph, give each value read from "
-					"them a named reroute (b_, s_, vec2_, vec3_, vec4_, tex_) and read it through reroute usages. Other selected "
+					"them a named reroute (prefixed and colored by type, see Project Settings > Plugins > Material Reroute Tools) and read it through reroute usages. Other selected "
 					"nodes are ignored; same-named parameters are merged."), NumToOrganize),
 				FSlateIcon(),
 				FUIAction(OnGraph(Graph, &VrrOrganizeParameters::OrganizeSelection)));

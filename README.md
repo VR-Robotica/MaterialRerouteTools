@@ -8,6 +8,9 @@ Supported engine: **5.8**. Platforms: Windows, macOS, Linux (editor).
 
 ## Type prefixes and colors
 
+Both are set per project in **Project Settings > Plugins > Material Reroute Tools** (saved to `DefaultEditor.ini`, so
+a team shares them). Changes apply to reroutes made afterwards. The defaults:
+
 | Type | Prefix | Color |
 |---|---|---|
 | Boolean / static bool | `b_` | red |
@@ -19,6 +22,7 @@ Supported engine: **5.8**. Platforms: Windows, macOS, Linux (editor).
 | Material attributes | `ma_` | purple |
 | Shading model | `sm_` | teal |
 | Normal map RGB | type prefix | light blue (0.5, 0.5, 1) |
+| Unknown type | none | grey |
 
 The type comes from the pin itself where the node knows it (parameters, samplers, function outputs, masked pins),
 and is otherwise worked out from the graph: component masks and appends are counted, reroutes and function calls are
@@ -51,7 +55,7 @@ name, so tagging your own material function pins this way makes them reroute cle
 
 ## Right-click node menus (materials)
 
-Under the node right-click menu's **VRR** section:
+Under the node right-click menu's **Material Reroute Tools** section:
 
 - **Organize Parameters into Named Reroutes** (selection with parameters): gathers the selected parameters into a
   column at the top left of the graph, gives each value read from them a typed named reroute and replaces the long

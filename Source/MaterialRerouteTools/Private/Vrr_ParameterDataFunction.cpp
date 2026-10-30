@@ -357,7 +357,7 @@ namespace VrrParameterData
 		FSaveAssetDialogConfig Config;
 		Config.DialogTitleOverride = LOCTEXT("SaveTitle", "Save Parameter Data Function");
 		Config.DefaultPath = FPackageName::GetLongPackagePath(MaterialPackage);
-		// PARAM_<Material>, without the material's own "M_" prefix (M_Toon_Base -> PARAM_Toon_Base)
+		// PARAM_<Material>, without the material's own "M_" prefix (M_Rock -> PARAM_Rock)
 		FString MaterialName = FPackageName::GetShortName(MaterialPackage);
 		MaterialName.RemoveFromStart(TEXT("M_"));
 		Config.DefaultAssetName = TEXT("PARAM_") + MaterialName;
