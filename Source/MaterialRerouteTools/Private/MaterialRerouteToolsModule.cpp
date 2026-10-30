@@ -9,6 +9,8 @@
  *     - Create Parameter Data Function, Add to Parameter Data Function > (Vrr_ParameterDataFunction)
  *   Result node and Make / Set Material Attributes nodes:
  *     - Organize Inputs into Named Reroutes (Vrr_OrganizeInputs)
+ *   Expression nodes with a value output (and their output pins), in materials and material functions:
+ *     - Export Node to Texture... (Vrr_ExportNodeTexture)
  *
  * The drag-off-a-pin menu gets "Create Prefixed Named Reroute" (node outputs, and the inputs of the nodes above)
  * through the graph schema instead (Vrr_PrefixedReroute, nothing to register here; it also works in functions).
@@ -18,12 +20,14 @@
  * menus are the ones to extend. The Result node has its own class, so its own menu. No engine code is touched.
  */
 
+#include "Algo/Transform.h"
 #include "Modules/ModuleManager.h"
 #include "ToolMenus.h"
 #include "EdGraph/EdGraphNode.h"
 #include "MaterialGraph/MaterialGraph.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialFunctionInterface.h"
+#include "Vrr_ExportNodeTexture.h"
 #include "Vrr_OrganizeInputs.h"
 #include "Vrr_OrganizeParameters.h"
 #include "Vrr_ParameterDataFunction.h"
@@ -78,6 +82,73 @@ namespace
 			FUIAction(
 				OnGraph(Graph, [WeakNode](UMaterialGraph* G) { VrrOrganizeInputs::OrganizeInputs(G, WeakNode.Get()); }),
 				FCanExecuteAction::CreateLambda([NumInputs]() { return NumInputs > 0; })));
+	}
+
+	void AddExportNode(UToolMenu* Menu)
+	{
+		// Unlike the other node tools, this one also works in material functions
+		const UGraphNodeContextMenuContext* Context = Menu->FindContext<UGraphNodeContextMenuContext>();
+		UMaterialGraph* Graph = Context && Context->Node ? const_cast<UMaterialGraph*>(Cast<UMaterialGraph>(Context->Graph)) : nullptr;
+		if (!Graph || (!Graph->Material && !Graph->MaterialFunction))
+		{
+			return;
+		}
+		const TArray<VrrExportNode::FOutput> Outputs = VrrExportNode::GetExportableOutputs(Context->Node);
+		if (Outputs.IsEmpty())
+		{
+			return;
+		}
+
+		// In a function, every function input the node reads needs a value of its own
+		TArray<FString> Missing;
+		if (Graph->MaterialFunction)
+		{
+			Algo::Transform(VrrExportNode::FunctionInputsWithoutDefault(Context->Node), Missing, [](FName N) { return N.ToString(); });
+		}
+		const bool bCanExport = Missing.IsEmpty();
+
+		TWeakObjectPtr<const UEdGraphNode> WeakNode(Context->Node);
+		auto ExportAction = [Graph, WeakNode, bCanExport](int32 Output)
+		{
+			return FUIAction(
+				OnGraph(Graph, [WeakNode, Output](UMaterialGraph* G) { VrrExportNode::Export(G, WeakNode.Get(), Output); }),
+				FCanExecuteAction::CreateLambda([bCanExport]() { return bCanExport; }));
+		};
+		const FText Tooltip = bCanExport
+			? LOCTEXT("ExportTooltip",
+				"Render this node's value across a texture's 0-1 UVs and save it as a texture asset (Color, Linear data or HDR). "
+				"Picking an existing texture updates it, so the node can be re-exported after changes.")
+			: FText::Format(LOCTEXT("ExportNoDefaultTooltip",
+				"This node reads function input(s) {0}, which have no value outside a call. Turn on \"Use Preview Value as "
+				"Default\" on them to export it."), FText::FromString(FString::Join(Missing, TEXT(", "))));
+
+		// Right-clicked on an output pin: export that one
+		const int32 PinOutput = VrrExportNode::OutputIndexOfPin(Context->Node, Context->Pin);
+		const VrrExportNode::FOutput* OnPin = Outputs.FindByPredicate([PinOutput](const VrrExportNode::FOutput& O) { return O.Index == PinOutput; });
+		if (OnPin || Outputs.Num() == 1)
+		{
+			const VrrExportNode::FOutput& Only = OnPin ? *OnPin : Outputs[0];
+			VrrSection(Menu).AddMenuEntry(
+				"ExportNodeToTexture",
+				OnPin && Outputs.Num() > 1
+					? FText::Format(LOCTEXT("ExportPinLabel", "Export {0} to Texture..."), Only.Label)
+					: LOCTEXT("ExportNodeLabel", "Export Node to Texture..."),
+				Tooltip, FSlateIcon(), ExportAction(Only.Index));
+			return;
+		}
+		VrrSection(Menu).AddSubMenu(
+			"ExportNodeToTexture",
+			LOCTEXT("ExportNodeSubLabel", "Export Node to Texture"),
+			Tooltip,
+			FNewToolMenuDelegate::CreateLambda([Outputs, ExportAction, Tooltip](UToolMenu* SubMenu)
+			{
+				FToolMenuSection& Section = SubMenu->AddSection("Outputs", LOCTEXT("OutputsLabel", "Outputs"));
+				for (const VrrExportNode::FOutput& O : Outputs)
+				{
+					Section.AddMenuEntry(FName(*FString::Printf(TEXT("Output%d"), O.Index)), FText::Format(LOCTEXT("ExportOutputLabel", "{0}..."), O.Label),
+						Tooltip, FSlateIcon(), ExportAction(O.Index));
+				}
+			}));
 	}
 
 	void AddParameterTools(UToolMenu* Menu)
@@ -180,6 +251,7 @@ private:
 		NodeMenu->AddDynamicSection("VrrOrganizeInputs", FNewToolMenuDelegate::CreateStatic(&AddOrganizeInputs));
 		ResultMenu->AddDynamicSection("VrrOrganizeInputs", FNewToolMenuDelegate::CreateStatic(&AddOrganizeInputs));
 		NodeMenu->AddDynamicSection("VrrParameterTools", FNewToolMenuDelegate::CreateStatic(&AddParameterTools));
+		NodeMenu->AddDynamicSection("VrrExportNode", FNewToolMenuDelegate::CreateStatic(&AddExportNode));
 	}
 };
 

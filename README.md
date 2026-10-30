@@ -67,6 +67,21 @@ Under the node right-click menu's **Material Reroute Tools** section:
   typed output each, and reads them back here through the function and named reroutes.
 - **Add to Parameter Data Function**: moves selected parameters into a parameter data function the material already
   calls, as new outputs.
+- **Export Node to Texture...** (any node with a value output): renders the node's value across a texture's 0-1 UVs
+  and saves it as a texture asset, e.g. to bake procedural noise, gradients or masks. Right-click an output pin to
+  export that output; a node with several outputs gets a submenu. Choose the size (128 to 4096) and format:
+  - **Color (sRGB, 8-bit)**: for colors. Sampling the texture gives the node's values back.
+  - **Linear data (8-bit)**: for masks and other 0-1 data (sRGB off; a single value becomes a grayscale texture).
+  - **HDR (16-bit float)**: keeps values below 0 and above 1.
+
+  A 4-channel output keeps its alpha. Picking an existing texture in the save dialog updates it, so a node can be
+  re-exported after the graph changes. Parameters use their default values, and unapplied edits are included.
+
+  Also works in **material functions**. There the node is rendered as if the function were called with nothing
+  wired, so every function input it reads (directly or further upstream) needs **Use Preview Value as Default** on;
+  otherwise the menu entry is greyed out and its tooltip names the inputs to change.
+  Nodes that read the scene (world position, camera, scene textures, vertex data) have nothing to read on a flat
+  render target, so they export as flat or meaningless values.
 
 ## Installation
 

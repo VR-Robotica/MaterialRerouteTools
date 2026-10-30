@@ -19,8 +19,11 @@ public class MaterialRerouteTools : ModuleRules
 			"MaterialEditor",	// IMaterialEditor, FMaterialEditorUtilities, UMaterialEditingLibrary
 			"ToolMenus",		// graph context menu extension
 			"AssetTools",		// creating the material function asset
+			"AssetRegistry",	// registering exported node textures
+			"RHI",				// shader platform the node texture is compiled for
 			"ContentBrowser",	// save asset dialog
 			"DeveloperSettings",	// Project Settings page for prefixes and colors
+			"InputCore",		// keys used by the export dialog's size combo box
 			"Slate",
 			"SlateCore"
 		});
