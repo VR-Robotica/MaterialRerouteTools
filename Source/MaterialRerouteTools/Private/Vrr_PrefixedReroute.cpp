@@ -32,9 +32,16 @@
 #include "MaterialGraph/MaterialGraph.h"
 #include "MaterialGraph/MaterialGraphNode.h"
 #include "MaterialGraph/MaterialGraphSchema.h"
-#include "MaterialGraph/MaterialShaderValueTypeObject.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "ScopedTransaction.h"
+
+// Engines whose material translator stores each wire's compiled type on the graph pin (newer than 5.6)
+#if __has_include("MaterialGraph/MaterialShaderValueTypeObject.h")
+#include "MaterialGraph/MaterialShaderValueTypeObject.h"
+#define VRR_HAS_COMPILED_PIN_TYPES 1
+#else
+#define VRR_HAS_COMPILED_PIN_TYPES 0
+#endif
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(Vrr_PrefixedReroute)
 
@@ -53,9 +60,10 @@ namespace
 		return Node && Node->MaterialExpression ? Node : nullptr;
 	}
 
-	/** Kind of the wire leaving FromPin: the compiled type stored on the pin, else worked out from the graph. */
+	/** Kind of the wire leaving FromPin: the compiled type stored on the pin (where the engine has it), else worked out from the graph. */
 	VrrReroute::EKind KindOfWire(const UEdGraphPin* FromPin, UMaterialExpression* Source)
 	{
+#if VRR_HAS_COMPILED_PIN_TYPES
 		if (const UMaterialShaderValueTypeObject* Compiled = Cast<UMaterialShaderValueTypeObject>(FromPin->PinType.PinSubCategoryObject.Get()))
 		{
 			const VrrReroute::EKind Kind = VrrReroute::KindOfShaderType(Compiled->ValueType);
@@ -64,6 +72,7 @@ namespace
 				return Kind;
 			}
 		}
+#endif
 		return VrrReroute::InferKind(Source, FromPin->SourceIndex);
 	}
 
