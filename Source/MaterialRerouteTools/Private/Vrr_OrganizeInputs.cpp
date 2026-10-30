@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * Organize Inputs into Named Reroutes: breaks the wires into the material's Result node (or a Make / Set Material
  * Attributes node) into named reroutes that carry the input's type prefix and name.

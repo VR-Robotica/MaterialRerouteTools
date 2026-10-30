@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * Organize Parameters into Named Reroutes: gathers the selected material parameters into one column at the top left
  * of the graph and wires the rest of the material to them through named reroutes.

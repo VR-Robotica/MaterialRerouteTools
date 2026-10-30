@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * Shared rules for the named reroutes the VRR material tools create (see Vrr_RerouteStyle.h):
  *  - kinds: what a pin or wire carries (KindOf / InferKind: node types, type tags, masks, a table of engine input
@@ -10,6 +12,7 @@
 #include "Vrr_MaterialGraphUtils.h"
 
 #include "Algo/AllOf.h"
+#include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionActorPositionWS.h"
 #include "Materials/MaterialExpressionAppendVector.h"

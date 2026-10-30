@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 using UnrealBuildTool;
 
 /** Material Reroute Tools: editor-only material graph context menu actions. Never ships with the game. */

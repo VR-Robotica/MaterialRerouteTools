@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * Create Prefixed Named Reroute, from the menu that opens when a wire is dragged off a pin.
  *

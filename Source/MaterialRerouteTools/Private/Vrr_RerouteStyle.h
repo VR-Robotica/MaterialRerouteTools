@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 #pragma once
 
 #include "CoreMinimal.h"

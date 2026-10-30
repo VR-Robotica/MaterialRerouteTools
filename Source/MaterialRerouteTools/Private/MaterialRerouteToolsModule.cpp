@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * MaterialRerouteTools: editor-only material graph tools, in a "VRR" section of the material graph's right-click
  * menus (materials only, not material functions):

@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 /*
  * Create Parameter Data Function: moves the selected material parameters into a new material function.
  *

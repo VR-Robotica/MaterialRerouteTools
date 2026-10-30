@@ -1,3 +1,5 @@
+// Copyright VR Robotica. All Rights Reserved.
+
 #include "Vrr_MaterialGraphUtils.h"
 
 #include "Framework/Notifications/NotificationManager.h"
