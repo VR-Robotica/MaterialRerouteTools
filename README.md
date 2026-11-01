@@ -9,7 +9,8 @@ Supported engines: **5.6, 5.7, 5.8**. Platforms: Windows, macOS, Linux (editor).
 ## Type prefixes and colors
 
 Both are set per project in **Project Settings > Plugins > Material Reroute Tools** (saved to `DefaultEditor.ini`, so
-a team shares them). Changes apply to reroutes made afterwards. The defaults:
+a team shares them). Changes apply to reroutes made afterwards; to bring existing ones up to date, use **Update Named
+Reroute Colors** and **Update Named Reroute Prefixes** (below). The defaults:
 
 | Type | Prefix | Color |
 |---|---|---|
@@ -52,6 +53,31 @@ Names come from what the pin carries:
 
 Pin names with a type tag such as `Light Mask (S)` or `Base Color (V3)` set the type and the tag is left out of the
 name, so tagging your own material function pins this way makes them reroute cleanly.
+
+## Update Named Reroute Colors (materials and material functions)
+
+Right-click any named reroute declaration or usage (under **Material Reroute Tools**), or right-click empty graph
+space and search for it. Every named reroute in the graph gets the current color for its type from the project
+settings, so graphs made before a color change match again. The type comes from the name prefix (`vec3_Normal` is a
+Vector 3), else from what feeds the reroute; a normal map's RGB keeps the normal-map color. Reroutes with neither a
+known prefix nor a typed input keep their color. One undo step; the entry is greyed out when everything already
+matches.
+
+## Update Named Reroute Prefixes (materials and material functions)
+
+In the same places as Update Named Reroute Colors. Checks every named reroute in the graph against the type it
+carries (worked out from what feeds it) and renames the ones that are off:
+
+| Before | After | Why |
+|---|---|---|
+| `Normal` | `vec3_Normal` | no prefix |
+| `float3_Normal` | `vec3_Normal` | old prefix |
+| `s_Normal` | `vec3_Normal` | prefix for another type |
+
+Recognized prefixes are the current ones, the plugin's defaults (so a project that changed them can catch up), and
+any listed under **Old Prefixes** in the project settings. An unwired reroute keeps the type its prefix says (only an
+out-of-date prefix is swapped). The renames are listed for you to confirm first; usages follow their declaration and
+renamed reroutes get their type's color. One undo step.
 
 ## Right-click node menus (materials)
 

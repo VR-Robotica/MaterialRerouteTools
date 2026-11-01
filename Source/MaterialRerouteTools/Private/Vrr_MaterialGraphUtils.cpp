@@ -13,6 +13,7 @@
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
+#include "Materials/MaterialFunction.h"
 #include "Widgets/Notifications/SNotificationList.h"
 
 namespace VrrGraph
@@ -194,6 +195,51 @@ namespace VrrGraph
 			}
 		}
 		Graph->SelectNodeSet(Nodes);
+	}
+
+	TConstArrayView<TObjectPtr<UMaterialExpression>> ExpressionsOf(const UMaterialGraph* Graph)
+	{
+		if (Graph && Graph->MaterialFunction)
+		{
+			return Graph->MaterialFunction->GetExpressions();
+		}
+		return Graph && Graph->Material ? Graph->Material->GetExpressions() : TConstArrayView<TObjectPtr<UMaterialExpression>>();
+	}
+
+	TArray<UMaterialExpressionNamedRerouteDeclaration*> NamedRerouteDeclarations(const UMaterialGraph* Graph)
+	{
+		TArray<UMaterialExpressionNamedRerouteDeclaration*> Result;
+		for (UMaterialExpression* E : ExpressionsOf(Graph))
+		{
+			if (UMaterialExpressionNamedRerouteDeclaration* Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(E))
+			{
+				Result.Add(Declaration);
+			}
+		}
+		return Result;
+	}
+
+	void RedrawAfterRerouteEdit(UMaterialGraph* Graph, TConstArrayView<UMaterialExpressionNamedRerouteDeclaration*> Edited)
+	{
+		TSet<UEdGraph*> Graphs = { Graph };
+		for (const UMaterialExpressionNamedRerouteDeclaration* Declaration : Edited)
+		{
+			if (Declaration->GraphNode)
+			{
+				Graphs.Add(Declaration->GraphNode->GetGraph());	// may be a composite's subgraph
+			}
+		}
+		for (UEdGraph* G : Graphs)
+		{
+			G->NotifyGraphChanged();
+		}
+		FMaterialEditorUtilities::MarkMaterialDirty(Graph);
+	}
+
+	bool IsNamedRerouteNode(const UEdGraphNode* Node)
+	{
+		const UMaterialGraphNode* MaterialNode = Cast<UMaterialGraphNode>(Node);
+		return MaterialNode && Cast<UMaterialExpressionNamedRerouteBase>(MaterialNode->MaterialExpression.Get());
 	}
 
 	void Notify(const FText& Message, bool bSuccess)

@@ -75,9 +75,25 @@ namespace VrrReroute
 	/** Color per kind from the project settings (Unknown gets the Unknown Type Color, grey by default). */
 	FLinearColor Color(EKind Kind);
 
+	/** A type prefix found at the start of a reroute name. */
+	struct FPrefixMatch
+	{
+		EKind Kind = EKind::Unknown;	// Unknown for an Old Prefixes entry (or no match)
+		int32 Length = 0;				// 0: no prefix
+	};
+
+	/**
+	 * The type prefix a reroute name starts with ("vec3_Normal" -> Vector3, length 5), the longest that fits from the
+	 * first set that has one: the project's current prefixes, the plugin's default ones, the project's Old Prefixes.
+	 */
+	FPrefixMatch MatchPrefix(const FString& Name);
+
 	/** Texture sample set to sample a normal map (a plain sampler also counts if its texture object does). */
 	bool IsNormalSampler(const UMaterialExpression* E);
 
-	/** Color for a reroute reading Source's Pin as Kind: the normal-map color for a normal sampler's RGB pin. */
+	/** Color for a reroute reading Source's Pin as Kind: the normal-map color for a normal sampler's RGB pin. Source may be null. */
 	FLinearColor ColorFor(const UMaterialExpression* Source, int32 Pin, EKind Kind);
+
+	/** ColorFor what Link reads; a masked link is just Kind's color. */
+	FLinearColor ColorForLink(const FExpressionInput& Link, EKind Kind);
 }

@@ -6,6 +6,7 @@
 #include "Materials/MaterialExpression.h"
 
 class IMaterialEditor;
+class UEdGraphNode;
 class UMaterial;
 class UMaterialGraph;
 class UMaterialExpressionNamedRerouteDeclaration;
@@ -91,6 +92,18 @@ namespace VrrGraph
 
 	/** After an edit: rebuild the graph, tell the editor the material changed, and select Select (replacing the selection). */
 	void FinishEdit(UMaterialGraph* Graph, IMaterialEditor& Editor, TConstArrayView<const UMaterialExpression*> Select);
+
+	/** Every expression of the material or function the graph edits (composite subgraphs included). */
+	TConstArrayView<TObjectPtr<UMaterialExpression>> ExpressionsOf(const UMaterialGraph* Graph);
+
+	/** Every named reroute declaration in ExpressionsOf(Graph). */
+	TArray<UMaterialExpressionNamedRerouteDeclaration*> NamedRerouteDeclarations(const UMaterialGraph* Graph);
+
+	/** After declarations were renamed or recolored: redraw their graphs (usages follow) and mark the material changed. */
+	void RedrawAfterRerouteEdit(UMaterialGraph* Graph, TConstArrayView<UMaterialExpressionNamedRerouteDeclaration*> Edited);
+
+	/** True for named reroute declaration and usage nodes. */
+	bool IsNamedRerouteNode(const UEdGraphNode* Node);
 
 	/** Success / failure toast. */
 	void Notify(const FText& Message, bool bSuccess);

@@ -216,15 +216,13 @@ namespace VrrOrganizeInputs
 
 	void RerouteStyleFor(const FNamedInput& Input, FString& OutName, FLinearColor& OutColor)
 	{
-		UMaterialExpression* Source = Input.Input->Expression;
-		const int32 Pin = Input.Input->OutputIndex;
 		VrrReroute::EKind Kind = VrrReroute::KindOfType(Input.Type);
 		if (Kind == VrrReroute::EKind::Unknown)
 		{
 			Kind = VrrReroute::InferLinkKind(*Input.Input);
 		}
 		OutName = FString::Printf(TEXT("%s%s"), VrrReroute::Prefix(Kind), *Input.Name);
-		OutColor = Source ? VrrReroute::ColorFor(Source, Pin, Kind) : VrrReroute::Color(Kind);
+		OutColor = VrrReroute::ColorForLink(*Input.Input, Kind);
 	}
 
 	bool CanOrganize(const UMaterialGraph* Graph, const UEdGraphNode* Node)

@@ -11,6 +11,9 @@
  *     - Organize Inputs into Named Reroutes (Vrr_OrganizeInputs)
  *   Expression nodes with a value output (and their output pins), in materials and material functions:
  *     - Export Node to Texture... (Vrr_ExportNodeTexture)
+ *   Named reroute declarations and usages, in materials and material functions:
+ *     - Update Named Reroute Colors, Update Named Reroute Prefixes... (Vrr_UpdateReroutes; also on empty graph space,
+ *       through the schema)
  *
  * The drag-off-a-pin menu gets "Create Prefixed Named Reroute" (node outputs, and the inputs of the nodes above)
  * through the graph schema instead (Vrr_PrefixedReroute, nothing to register here; it also works in functions).
@@ -28,9 +31,11 @@
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialFunctionInterface.h"
 #include "Vrr_ExportNodeTexture.h"
+#include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_OrganizeInputs.h"
 #include "Vrr_OrganizeParameters.h"
 #include "Vrr_ParameterDataFunction.h"
+#include "Vrr_UpdateReroutes.h"
 
 #define LOCTEXT_NAMESPACE "MaterialRerouteTools"
 
@@ -151,6 +156,29 @@ namespace
 			}));
 	}
 
+	void AddRerouteUpdates(UToolMenu* Menu)
+	{
+		// Named reroute nodes, in materials and material functions (empty graph space gets these through the schema)
+		const UGraphNodeContextMenuContext* Context = Menu->FindContext<UGraphNodeContextMenuContext>();
+		UMaterialGraph* Graph = Context && Context->Node ? const_cast<UMaterialGraph*>(Cast<UMaterialGraph>(Context->Graph)) : nullptr;
+		if (!Graph || !VrrGraph::IsNamedRerouteNode(Context->Node))
+		{
+			return;
+		}
+		auto Add = [Menu, Graph](FName Name, const FText& Label, const VrrUpdateReroutes::FCount& Count, const FText& Tooltip, void (*Update)(UMaterialGraph*))
+		{
+			VrrSection(Menu).AddMenuEntry(Name, Label, Tooltip, FSlateIcon(), FUIAction(
+				OnGraph(Graph, Update),
+				FCanExecuteAction::CreateLambda([bAny = Count.ToChange > 0]() { return bAny; })));
+		};
+		const VrrUpdateReroutes::FCount Colors = VrrUpdateReroutes::CountColors(Graph);
+		const VrrUpdateReroutes::FCount Prefixes = VrrUpdateReroutes::CountPrefixes(Graph);
+		Add("UpdateNamedRerouteColors", LOCTEXT("UpdateColorsLabel", "Update Named Reroute Colors"),
+			Colors, VrrUpdateReroutes::ColorsTooltip(Colors), &VrrUpdateReroutes::UpdateColors);
+		Add("UpdateNamedReroutePrefixes", LOCTEXT("UpdatePrefixesLabel", "Update Named Reroute Prefixes..."),
+			Prefixes, VrrUpdateReroutes::PrefixesTooltip(Prefixes), &VrrUpdateReroutes::UpdatePrefixes);
+	}
+
 	void AddParameterTools(UToolMenu* Menu)
 	{
 		UMaterialGraph* Graph = MaterialGraphOf(Menu->FindContext<UGraphNodeContextMenuContext>());
@@ -252,6 +280,7 @@ private:
 		ResultMenu->AddDynamicSection("VrrOrganizeInputs", FNewToolMenuDelegate::CreateStatic(&AddOrganizeInputs));
 		NodeMenu->AddDynamicSection("VrrParameterTools", FNewToolMenuDelegate::CreateStatic(&AddParameterTools));
 		NodeMenu->AddDynamicSection("VrrExportNode", FNewToolMenuDelegate::CreateStatic(&AddExportNode));
+		NodeMenu->AddDynamicSection("VrrRerouteUpdates", FNewToolMenuDelegate::CreateStatic(&AddRerouteUpdates));
 	}
 };
 

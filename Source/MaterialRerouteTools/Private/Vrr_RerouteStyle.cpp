@@ -495,20 +495,10 @@ namespace VrrReroute
 			return Channel == INDEX_NONE ? Base : VrrGraph::ChannelName(Source, Base, Channel);
 		}
 
-		/** A named reroute's name without its type prefix: "vec3_Normal" -> "Normal" (the longest prefix that fits). */
+		/** A named reroute's name without its type prefix: "vec3_Normal" -> "Normal" (see MatchPrefix). */
 		FString WithoutPrefix(const FString& Name)
 		{
-			int32 Longest = 0;
-			for (EKind Kind : { EKind::Bool, EKind::Scalar, EKind::Vector2, EKind::Vector3, EKind::Vector4, EKind::Texture, EKind::MaterialAttributes, EKind::ShadingModel })
-			{
-				const TCHAR* KindPrefix = Prefix(Kind);
-				const int32 Length = FCString::Strlen(KindPrefix);
-				if (Length > Longest && Name.StartsWith(KindPrefix, ESearchCase::CaseSensitive))
-				{
-					Longest = Length;
-				}
-			}
-			return Name.RightChop(Longest);
+			return Name.RightChop(MatchPrefix(Name).Length);
 		}
 
 		/** Name of the value a link carries, through reroutes and named reroutes (the reroute's name, prefix dropped). */
@@ -614,6 +604,44 @@ namespace VrrReroute
 		return Style ? Style->Color : UVrrRerouteSettings::Get().UnknownColor;
 	}
 
+	FPrefixMatch MatchPrefix(const FString& Name)
+	{
+		constexpr EKind Typed[] = { EKind::Bool, EKind::Scalar, EKind::Vector2, EKind::Vector3, EKind::Vector4, EKind::Texture, EKind::MaterialAttributes, EKind::ShadingModel };
+		const TCHAR* const Defaults[] = { VrrDefaultPrefix::Bool, VrrDefaultPrefix::Scalar, VrrDefaultPrefix::Vector2, VrrDefaultPrefix::Vector3,
+			VrrDefaultPrefix::Vector4, VrrDefaultPrefix::Texture, VrrDefaultPrefix::MaterialAttributes, VrrDefaultPrefix::ShadingModel };
+		static_assert(UE_ARRAY_COUNT(Typed) == UE_ARRAY_COUNT(Defaults));
+
+		// Longest match wins within each set, so "sm_" isn't read as "s_"
+		FPrefixMatch Match;
+		auto Consider = [&Name, &Match](const TCHAR* Candidate, EKind Kind)
+		{
+			const int32 Length = FCString::Strlen(Candidate);
+			if (Length > Match.Length && Name.StartsWith(Candidate, ESearchCase::CaseSensitive))
+			{
+				Match = { Kind, Length };
+			}
+		};
+		for (EKind Kind : Typed)
+		{
+			Consider(Prefix(Kind), Kind);
+		}
+		if (Match.Length == 0)
+		{
+			for (int32 i = 0; i < UE_ARRAY_COUNT(Typed); ++i)
+			{
+				Consider(Defaults[i], Typed[i]);
+			}
+		}
+		if (Match.Length == 0)
+		{
+			for (const FString& Old : UVrrRerouteSettings::Get().OldPrefixes)
+			{
+				Consider(*Old, EKind::Unknown);
+			}
+		}
+		return Match;
+	}
+
 	bool IsNormalSampler(const UMaterialExpression* E)
 	{
 		auto IsNormal = [](EMaterialSamplerType Type) { return Type == SAMPLERTYPE_Normal || Type == SAMPLERTYPE_VirtualNormal; };
@@ -637,5 +665,10 @@ namespace VrrReroute
 			return UVrrRerouteSettings::Get().NormalMapColor;	// RGB of a normal map
 		}
 		return Color(Kind);
+	}
+
+	FLinearColor ColorForLink(const FExpressionInput& Link, EKind Kind)
+	{
+		return Link.Mask ? Color(Kind) : ColorFor(Link.Expression, Link.OutputIndex, Kind);
 	}
 }
