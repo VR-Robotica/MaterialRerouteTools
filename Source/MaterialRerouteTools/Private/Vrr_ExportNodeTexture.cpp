@@ -13,7 +13,12 @@
  *      In a material function, the function is copied instead, the copy gets an extra output fed by the node, and a
  *      new Unlit material calls it. Function inputs then behave as in any call: only those with "Use Preview Value
  *      as Default" have a value, so the tool refuses nodes that read any other input.
- *   4. Write: the pixels become the texture's source data (sRGB 8-bit, linear 8-bit or 16-bit float).
+ *      Before drawing, the shaders are checked on every platform involved (the editor's highest, and the one the editor
+ *      world draws with, which differs under a Preview Rendering Level): a material that can't render there is drawn
+ *      with the default material, whose emissive is black. Textures the material samples are finished building and
+ *      fully streamed in so the bake doesn't read placeholders or low mips.
+ *   4. Write: the pixels become the texture's source data (sRGB 8-bit, linear 8-bit or 16-bit float). A result
+ *      that is black in every channel is almost always a failed bake, so the tool asks before saving it.
  */
 
 #include "Vrr_ExportNodeTexture.h"
@@ -23,7 +28,9 @@
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "ContentBrowserModule.h"
+#include "DataDrivenShaderPlatformInfo.h"
 #include "Editor.h"
+#include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Framework/Application/SlateApplication.h"
@@ -45,11 +52,13 @@
 #include "Materials/MaterialExpressionSubstrate.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/EngineVersionComparison.h"
+#include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/ScopedSlowTask.h"
 #include "RenderUtils.h"
 #include "ShaderCompiler.h"
 #include "Styling/AppStyle.h"
+#include "TextureCompiler.h"
 #include "TextureResource.h"
 #include "UObject/Package.h"
 #include "Widgets/Input/SButton.h"
@@ -62,6 +71,8 @@
 #include "Widgets/Text/STextBlock.h"
 
 #define LOCTEXT_NAMESPACE "VrrExportNodeTexture"
+
+DEFINE_LOG_CATEGORY_STATIC(LogVrrExportNode, Log, All);
 
 namespace VrrExportNode
 {
@@ -445,19 +456,19 @@ namespace VrrExportNode
 				{
 					GShaderCompilingManager->FinishAllCompilation();
 				}
-#if UE_VERSION_OLDER_THAN(5, 7, 0)
-				const FMaterialResource* Resource = Material->GetMaterialResource(GMaxRHIFeatureLevel);
-#else
-				const FMaterialResource* Resource = Material->GetMaterialResource(GMaxRHIShaderPlatform);
-#endif
-				if (!Resource || !Resource->GetCompileErrors().IsEmpty())
-				{
-					const FString Errors = Resource ? FString::Join(Resource->GetCompileErrors(), TEXT("\n")) : FString(TEXT("no shaders"));
-					OutError = FText::Format(LOCTEXT("CompileFailed", "The node doesn't compile on its own as an Unlit surface:\n{0}"), FText::FromString(Errors));
-					return false;
-				}
 
 				UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+				if (!World)
+				{
+					OutError = LOCTEXT("NoWorld", "There's no editor world to render in.");
+					return false;
+				}
+				if (!CheckShaders(World, OutError))
+				{
+					return false;
+				}
+				PrepareTextures();
+
 				UTextureRenderTarget2D* Target = UKismetRenderingLibrary::CreateRenderTarget2D(World, Size, Size, RTF_RGBA32f, FLinearColor::Black, false);
 				if (!Target)
 				{
@@ -476,6 +487,9 @@ namespace VrrExportNode
 				return true;
 			}
 
+			/** Likely reasons for a black bake, found while baking (shown if the result is black). */
+			const TArray<FString>& GetNotes() const { return Notes; }
+
 			~FBake()
 			{
 				for (UObject* Object : { static_cast<UObject*>(Material), static_cast<UObject*>(Function) })
@@ -489,13 +503,125 @@ namespace VrrExportNode
 			}
 
 		private:
+			/**
+			 * The bake material must have shaders on the editor's highest platform and on the one the editor world draws
+			 * with. They differ under a Preview Rendering Level, and a material missing there is silently drawn with
+			 * the default material (black emissive).
+			 */
+			bool CheckShaders(UWorld* World, FText& OutError)
+			{
+#if UE_VERSION_OLDER_THAN(5, 7, 0)
+				TArray<ERHIFeatureLevel::Type, TInlineAllocator<2>> Targets;
+				Targets.Add(World->GetFeatureLevel());
+				Targets.AddUnique(GMaxRHIFeatureLevel);
+				auto NameOf = [](ERHIFeatureLevel::Type Level) { FString Name; GetFeatureLevelName(Level, Name); return Name; };
+#else
+				TArray<EShaderPlatform, TInlineAllocator<2>> Targets;
+				Targets.Add(GetFeatureLevelShaderPlatform(World->GetFeatureLevel()));
+				Targets.AddUnique(GMaxRHIShaderPlatform);
+				auto NameOf = [](EShaderPlatform Platform) { return FDataDrivenShaderPlatformInfo::GetName(Platform).ToString(); };
+#endif
+				UE_LOG(LogVrrExportNode, Log, TEXT("Baking %s: world draws with %s, Substrate %s."),
+					*Material->GetName(), *NameOf(Targets[0]), Substrate::IsSubstrateEnabled() ? TEXT("on") : TEXT("off"));
+
+				for (const auto Target : Targets)
+				{
+					FMaterialResource* Resource = Material->GetMaterialResource(Target);
+					const FString Name = NameOf(Target);
+					if (!Resource)
+					{
+						OutError = FText::Format(LOCTEXT("NoResource", "The node wasn't compiled for {0}, which the editor draws with."), FText::FromString(Name));
+						return false;
+					}
+					Resource->FinishCompilation();
+					if (!Resource->GetCompileErrors().IsEmpty())
+					{
+						const FString Errors = FString::Join(Resource->GetCompileErrors(), TEXT("\n"));
+						UE_LOG(LogVrrExportNode, Warning, TEXT("Compile errors on %s:\n%s"), *Name, *Errors);
+						OutError = FText::Format(LOCTEXT("CompileFailed", "The node doesn't compile on its own as an Unlit surface on {0}:\n{1}"),
+							FText::FromString(Name), FText::FromString(Errors));
+						return false;
+					}
+					if (!Resource->GetGameThreadShaderMap())
+					{
+						OutError = FText::Format(LOCTEXT("NoShaderMap", "The node has no shaders for {0}, so it would draw as the default material."), FText::FromString(Name));
+						return false;
+					}
+					if (!Resource->IsGameThreadShaderMapComplete())
+					{
+						Notes.AddUnique(FString::Printf(TEXT("Shaders for %s are incomplete; the editor may have drawn the default material."), *Name));
+					}
+				}
+				return true;
+			}
+
+			/** Finishes building the sampled textures and streams in all their mips. */
+			void PrepareTextures()
+			{
+				TArray<UTexture*> Textures;
+				for (UObject* Object : Material->GetReferencedTextures())
+				{
+					if (UTexture* Texture = Cast<UTexture>(Object))
+					{
+						Textures.Add(Texture);
+					}
+				}
+				FTextureCompilingManager::Get().FinishCompilation(Textures);	// still building: drawn as a placeholder
+				for (UTexture* Texture : Textures)
+				{
+					Texture->SetForceMipLevelsToBeResident(30.0f);
+					Texture->WaitForStreaming();
+					if (Texture->IsCurrentlyVirtualTextured())
+					{
+						Notes.AddUnique(FString::Printf(TEXT("%s is a virtual texture; its pages may not be loaded outside a viewport. Turn off Virtual Texture Streaming on it to bake."),
+							*Texture->GetName()));
+					}
+				}
+			}
+
 			UMaterial* Material = nullptr;
 			UMaterialFunction* Function = nullptr;
 			UMaterialExpression* Expression = nullptr;
 			UMaterialExpressionSubstrateUnlitBSDF* Unlit = nullptr;
 			UMaterialExpressionComponentMask* AlphaMask = nullptr;
 			int32 Output = 0;
+			TArray<FString> Notes;
 		};
+
+		/** True when every channel the output has is exactly 0. */
+		bool IsAllBlack(const TArray<FLinearColor>& Pixels, int32 Width)
+		{
+			for (const FLinearColor& P : Pixels)
+			{
+				const float Channels[4] = { P.R, P.G, P.B, P.A };
+				for (int32 C = 0; C < FMath::Min(Width, 4); ++C)
+				{
+					if (Channels[C] != 0.0f)
+					{
+						return false;
+					}
+				}
+			}
+			return true;
+		}
+
+		/** Asks whether to save a black result anyway, listing likely causes. */
+		bool ConfirmBlack(const FBake& Bake)
+		{
+			FString Causes = FString::Join(Bake.GetNotes(), TEXT("\n- "));
+			if (!Causes.IsEmpty())
+			{
+				Causes = TEXT("\n- ") + Causes;
+			}
+			UE_LOG(LogVrrExportNode, Warning, TEXT("The bake came out black in every channel.%s"), *Causes);
+			const FText Message = FText::Format(LOCTEXT("BlackResult",
+				"The node rendered black in every channel. That usually means the bake failed rather than the node being black:\n\n"
+				"- It reads something the bake doesn't have (world position, vertex data, scene textures, per-instance data).\n"
+				"- A Preview Rendering Level is set and the node doesn't render there.\n"
+				"- A sampled texture isn't loaded (virtual textures especially).{0}\n\n"
+				"Save the black texture anyway?"), FText::FromString(Causes));
+			return FMessageDialog::Open(EAppMsgType::YesNo, Message, LOCTEXT("BlackResultTitle", "Export Node to Texture")) == EAppReturnType::Yes;
+		}
 
 		/** Writes Pixels into the texture at ObjectPath (created, or updated if it's already a texture). */
 		UTexture2D* WriteTexture(const FString& ObjectPath, int32 Size, int32 Width, EFormat Format, const TArray<FLinearColor>& Pixels, FText& OutError)
@@ -754,6 +880,12 @@ namespace VrrExportNode
 			{
 				P.B = 0.0f;
 			}
+		}
+
+		if (bOk && IsAllBlack(Pixels, Width) && !ConfirmBlack(Bake))
+		{
+			VrrGraph::Notify(LOCTEXT("BlackCancelled", "Export Node to Texture: the node rendered black, so nothing was saved. See the Output Log (LogVrrExportNode)."), false);
+			return;
 		}
 
 		// 4. Write
