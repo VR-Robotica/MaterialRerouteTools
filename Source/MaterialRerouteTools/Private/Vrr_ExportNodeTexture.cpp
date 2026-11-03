@@ -454,8 +454,18 @@ namespace VrrExportNode
 					Source = AlphaMask;
 					SourceOutput = 0;
 				}
-				FExpressionInput& Emissive = Unlit ? Unlit->EmissiveColor : Material->GetEditorOnlyData()->EmissiveColor;
-				Emissive.Connect(SourceOutput, Source);
+				if (Unlit)
+				{
+					Unlit->EmissiveColor.Connect(SourceOutput, Source);
+				}
+				else
+				{
+					// The material editor's copy sets UseConstant on unconnected outputs, and a constant wins over a
+					// connected expression, so without this the bake compiles the constant (black) instead of the node.
+					FColorMaterialInput& Emissive = Material->GetEditorOnlyData()->EmissiveColor;
+					Emissive.UseConstant = false;
+					Emissive.Connect(SourceOutput, Source);
+				}
 
 				UMaterialEditingLibrary::RecompileMaterial(Material);
 				if (GShaderCompilingManager)
