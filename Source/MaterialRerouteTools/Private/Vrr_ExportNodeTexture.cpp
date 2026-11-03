@@ -412,6 +412,12 @@ namespace VrrExportNode
 			{
 				Material->MaterialDomain = MD_Surface;
 				Material->BlendMode = BLEND_Opaque;
+				// SetShadingModel ensures the OLD model is below MSM_NUM, which "From Material Expression" isn't (seen
+				// without Substrate), so clear the private field first.
+				if (FByteProperty* ShadingModelProperty = FindFProperty<FByteProperty>(UMaterial::StaticClass(), TEXT("ShadingModel")))
+				{
+					*ShadingModelProperty->ContainerPtrToValuePtr<uint8>(Material) = MSM_Unlit;
+				}
 				Material->SetShadingModel(MSM_Unlit);
 				Material->bUseMaterialAttributes = false;
 				for (int32 Property = 0; Property < MP_MAX; ++Property)
