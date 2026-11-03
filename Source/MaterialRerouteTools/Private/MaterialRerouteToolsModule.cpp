@@ -98,25 +98,25 @@ namespace
 		{
 			return;
 		}
-		const TArray<VrrExportNode::FOutput> Outputs = VrrExportNode::GetExportableOutputs(Context->Node);
-		if (Outputs.IsEmpty())
+		const TArray<VrrExportNode::FOutput> ExportableOutputs = VrrExportNode::GetExportableOutputs(Context->Node);
+		if (ExportableOutputs.IsEmpty())
 		{
 			return;
 		}
 
 		// In a function, every function input the node reads needs a value of its own
-		TArray<FString> Missing;
+		TArray<FString> InputsWithoutDefault;
 		if (Graph->MaterialFunction)
 		{
-			Algo::Transform(VrrExportNode::FunctionInputsWithoutDefault(Context->Node), Missing, [](FName N) { return N.ToString(); });
+			Algo::Transform(VrrExportNode::FindFunctionInputsWithoutDefault(Context->Node), InputsWithoutDefault, [](FName InputName) { return InputName.ToString(); });
 		}
-		const bool bCanExport = Missing.IsEmpty();
+		const bool bCanExport = InputsWithoutDefault.IsEmpty();
 
 		TWeakObjectPtr<const UEdGraphNode> WeakNode(Context->Node);
-		auto ExportAction = [Graph, WeakNode, bCanExport](int32 Output)
+		auto MakeExportAction = [Graph, WeakNode, bCanExport](int32 OutputIndex)
 		{
 			return FUIAction(
-				OnGraph(Graph, [WeakNode, Output](UMaterialGraph* G) { VrrExportNode::Export(G, WeakNode.Get(), Output); }),
+				OnGraph(Graph, [WeakNode, OutputIndex](UMaterialGraph* TargetGraph) { VrrExportNode::Export(TargetGraph, WeakNode.Get(), OutputIndex); }),
 				FCanExecuteAction::CreateLambda([bCanExport]() { return bCanExport; }));
 		};
 		const FText Tooltip = bCanExport
@@ -125,33 +125,34 @@ namespace
 				"Picking an existing texture updates it, so the node can be re-exported after changes.")
 			: FText::Format(LOCTEXT("ExportNoDefaultTooltip",
 				"This node reads function input(s) {0}, which have no value outside a call. Turn on \"Use Preview Value as "
-				"Default\" on them to export it."), FText::FromString(FString::Join(Missing, TEXT(", "))));
+				"Default\" on them to export it."), FText::FromString(FString::Join(InputsWithoutDefault, TEXT(", "))));
 
-		// Right-clicked on an output pin: export that one
-		const int32 PinOutput = VrrExportNode::OutputIndexOfPin(Context->Node, Context->Pin);
-		const VrrExportNode::FOutput* OnPin = Outputs.FindByPredicate([PinOutput](const VrrExportNode::FOutput& O) { return O.Index == PinOutput; });
-		if (OnPin || Outputs.Num() == 1)
+		// Right-clicked on an output pin, or only one output: a single entry for it
+		const int32 ClickedOutputIndex = VrrExportNode::FindOutputIndexOfPin(Context->Node, Context->Pin);
+		const VrrExportNode::FOutput* ClickedOutput = ExportableOutputs.FindByPredicate(
+			[ClickedOutputIndex](const VrrExportNode::FOutput& Output) { return Output.Index == ClickedOutputIndex; });
+		if (ClickedOutput || ExportableOutputs.Num() == 1)
 		{
-			const VrrExportNode::FOutput& Only = OnPin ? *OnPin : Outputs[0];
-			VrrSection(Menu).AddMenuEntry(
-				"ExportNodeToTexture",
-				OnPin && Outputs.Num() > 1
-					? FText::Format(LOCTEXT("ExportPinLabel", "Export {0} to Texture..."), Only.Label)
-					: LOCTEXT("ExportNodeLabel", "Export Node to Texture..."),
-				Tooltip, FSlateIcon(), ExportAction(Only.Index));
+			const VrrExportNode::FOutput& Output = ClickedOutput ? *ClickedOutput : ExportableOutputs[0];
+			const FText Label = ClickedOutput && ExportableOutputs.Num() > 1
+				? FText::Format(LOCTEXT("ExportPinLabel", "Export {0} to Texture..."), Output.Label)
+				: LOCTEXT("ExportNodeLabel", "Export Node to Texture...");
+			VrrSection(Menu).AddMenuEntry("ExportNodeToTexture", Label, Tooltip, FSlateIcon(), MakeExportAction(Output.Index));
 			return;
 		}
+
+		// Several outputs: a submenu with one entry each
 		VrrSection(Menu).AddSubMenu(
 			"ExportNodeToTexture",
 			LOCTEXT("ExportNodeSubLabel", "Export Node to Texture"),
 			Tooltip,
-			FNewToolMenuDelegate::CreateLambda([Outputs, ExportAction, Tooltip](UToolMenu* SubMenu)
+			FNewToolMenuDelegate::CreateLambda([ExportableOutputs, MakeExportAction, Tooltip](UToolMenu* SubMenu)
 			{
 				FToolMenuSection& Section = SubMenu->AddSection("Outputs", LOCTEXT("OutputsLabel", "Outputs"));
-				for (const VrrExportNode::FOutput& O : Outputs)
+				for (const VrrExportNode::FOutput& Output : ExportableOutputs)
 				{
-					Section.AddMenuEntry(FName(*FString::Printf(TEXT("Output%d"), O.Index)), FText::Format(LOCTEXT("ExportOutputLabel", "{0}..."), O.Label),
-						Tooltip, FSlateIcon(), ExportAction(O.Index));
+					Section.AddMenuEntry(FName(*FString::Printf(TEXT("Output%d"), Output.Index)), FText::Format(LOCTEXT("ExportOutputLabel", "{0}..."), Output.Label),
+						Tooltip, FSlateIcon(), MakeExportAction(Output.Index));
 				}
 			}));
 	}

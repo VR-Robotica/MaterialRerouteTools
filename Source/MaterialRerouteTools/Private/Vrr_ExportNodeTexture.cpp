@@ -4,21 +4,21 @@
  * Export Node to Texture (see Vrr_ExportNodeTexture.h).
  *
  * Steps:
- *   1. Options: size and format (remembered per project in EditorPerProjectUserSettings).
- *   2. Where to save: the Content Browser's save dialog, next to the material by default. Picking an existing texture
+ *   1. Options: resolution and format, remembered per project in EditorPerProjectUserSettings.
+ *   2. Destination: the Content Browser's save dialog, next to the material by default. Picking an existing texture
  *      updates it in place, so a node can be re-exported after the graph changes.
- *   3. Bake: a transient copy of the material being edited (with unapplied edits) is turned into an opaque Unlit
- *      surface material whose only wired output is the node's value, compiled, and drawn into an RGBA32f render
- *      target. A 4-channel value takes a second pass with a component mask for its alpha.
- *      In a material function, the function is copied instead, the copy gets an extra output fed by the node, and a
- *      new Unlit material calls it. Function inputs then behave as in any call: only those with "Use Preview Value
- *      as Default" have a value, so the tool refuses nodes that read any other input.
- *      Before drawing, the shaders are checked on every platform involved (the editor's highest, and the one the editor
- *      world draws with, which differs under a Preview Rendering Level): a material that can't render there is drawn
- *      with the default material, whose emissive is black. Textures the material samples are finished building and
- *      fully streamed in so the bake doesn't read placeholders or low mips.
- *   4. Write: the pixels become the texture's source data (sRGB 8-bit, linear 8-bit or 16-bit float). A result
- *      that is black in every channel is almost always a failed bake, so the tool asks before saving it.
+ *   3. Bake: a transient copy of the material being edited (unapplied edits included) becomes an opaque Unlit surface
+ *      whose only wired output is the node's value. It is compiled and drawn into an RGBA32f render target. A
+ *      4-channel value takes a second pass through a component mask for its alpha.
+ *      For a node in a material function, the function is copied instead, the copy gets an extra output fed by the
+ *      node, and a new Unlit material calls it. Function inputs then behave as in any call: only those with "Use
+ *      Preview Value as Default" have a value, so the tool refuses nodes that read any other input.
+ *      Before drawing, the bake checks its shaders on the editor's highest platform and on the one the editor world
+ *      draws with (they differ under a Preview Rendering Level). A material without shaders there is silently drawn
+ *      as the default material, whose emissive is black. Sampled textures are finished building and fully streamed
+ *      in, so the bake doesn't read placeholders or low mips.
+ *   4. Write: the pixels become the texture's source data (sRGB 8-bit, linear 8-bit or 16-bit float). A result that
+ *      is 0 in every channel almost always means the bake failed, so the tool asks before saving it.
  */
 
 #include "Vrr_ExportNodeTexture.h"
@@ -26,6 +26,7 @@
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_RerouteStyle.h"
 
+#include "Algo/Transform.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "ContentBrowserModule.h"
 #include "DataDrivenShaderPlatformInfo.h"
@@ -42,21 +43,19 @@
 #include "MaterialGraph/MaterialGraphNode.h"
 #include "MaterialShared.h"
 #include "Materials/Material.h"
-#include "Algo/Transform.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
-#include "Materials/MaterialFunction.h"
 #include "Materials/MaterialExpressionSubstrate.h"
+#include "Materials/MaterialFunction.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/EngineVersionComparison.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "Misc/ScopedSlowTask.h"
 #include "RenderUtils.h"
-#include "ShaderCompiler.h"
 #include "Styling/AppStyle.h"
 #include "TextureCompiler.h"
 #include "TextureResource.h"
@@ -85,29 +84,37 @@ namespace VrrExportNode
 			HDR		// 16-bit float: values outside 0-1
 		};
 
-		struct FOptions
+		struct FExportOptions
 		{
-			int32 Size = 1024;
+			int32 Resolution = 1024;
 			EFormat Format = EFormat::Color;
 		};
 
+		/** Smallest and largest value over the channels an output has. */
+		struct FValueRange
+		{
+			float Min = 0.0f;
+			float Max = 0.0f;
+		};
+
 		const TCHAR* ConfigSection = TEXT("MaterialRerouteTools.ExportNodeTexture");
-		const int32 Sizes[] = { 128, 256, 512, 1024, 2048, 4096 };
+		const int32 Resolutions[] = { 128, 256, 512, 1024, 2048, 4096 };
+		constexpr int32 DefaultResolution = 1024;
 
 		/** Value types a texture can't hold. */
-		constexpr uint64 NotAValue = static_cast<uint64>(MCT_Texture) | MCT_SparseVolumeTexture | MCT_StaticBool | MCT_Bool | MCT_MaterialAttributes
+		constexpr uint64 NonValueTypes = static_cast<uint64>(MCT_Texture) | MCT_SparseVolumeTexture | MCT_StaticBool | MCT_Bool | MCT_MaterialAttributes
 			| MCT_ShadingModel | MCT_Substrate | MCT_Execution | MCT_VoidStatement | MCT_VTPageTableResult | MCT_TextureCollection;
 
-		UMaterialExpression* ExpressionOf(const UEdGraphNode* Node)
+		UMaterialExpression* GetExpression(const UEdGraphNode* Node)
 		{
 			const UMaterialGraphNode* MaterialNode = Cast<UMaterialGraphNode>(Node);
 			return MaterialNode ? MaterialNode->MaterialExpression.Get() : nullptr;
 		}
 
-		/** Channels the output gives: 1-4 (an unknown float counts as 3, like a color). */
-		int32 WidthOf(UMaterialExpression* Expression, int32 Output)
+		/** Channels an output gives, 1-4. A float of unknown width counts as 3, like a color. */
+		int32 GetChannelCount(UMaterialExpression* Expression, int32 OutputIndex)
 		{
-			switch (VrrReroute::InferKind(Expression, Output))
+			switch (VrrReroute::InferKind(Expression, OutputIndex))
 			{
 			case VrrReroute::EKind::Scalar:  return 1;
 			case VrrReroute::EKind::Vector2: return 2;
@@ -116,52 +123,68 @@ namespace VrrExportNode
 			}
 		}
 
-		FOptions LoadOptions(int32 Width)
+		/** Colors and data keep separate format choices, so exporting a mask doesn't change the next color export. */
+		const TCHAR* GetFormatConfigKey(int32 ChannelCount)
 		{
-			FOptions Options;
-			// Colors default to sRGB, single values and UV-like pairs to linear data
-			Options.Format = Width >= 3 ? EFormat::Color : EFormat::Linear;
-			GConfig->GetInt(ConfigSection, TEXT("Size"), Options.Size, GEditorPerProjectIni);
-			int32 Format = 0;
-			if (GConfig->GetInt(ConfigSection, Width >= 3 ? TEXT("ColorFormat") : TEXT("DataFormat"), Format, GEditorPerProjectIni))
+			return ChannelCount >= 3 ? TEXT("ColorFormat") : TEXT("DataFormat");
+		}
+
+		FExportOptions LoadOptions(int32 ChannelCount)
+		{
+			FExportOptions Options;
+			Options.Format = ChannelCount >= 3 ? EFormat::Color : EFormat::Linear;
+			GConfig->GetInt(ConfigSection, TEXT("Size"), Options.Resolution, GEditorPerProjectIni);
+			int32 SavedFormat = 0;
+			if (GConfig->GetInt(ConfigSection, GetFormatConfigKey(ChannelCount), SavedFormat, GEditorPerProjectIni))
 			{
-				Options.Format = static_cast<EFormat>(FMath::Clamp(Format, 0, 2));
+				Options.Format = static_cast<EFormat>(FMath::Clamp(SavedFormat, 0, 2));
 			}
 			return Options;
 		}
 
-		void SaveOptions(const FOptions& Options, int32 Width)
+		void SaveOptions(const FExportOptions& Options, int32 ChannelCount)
 		{
-			GConfig->SetInt(ConfigSection, TEXT("Size"), Options.Size, GEditorPerProjectIni);
-			GConfig->SetInt(ConfigSection, Width >= 3 ? TEXT("ColorFormat") : TEXT("DataFormat"), static_cast<int32>(Options.Format), GEditorPerProjectIni);
+			GConfig->SetInt(ConfigSection, TEXT("Size"), Options.Resolution, GEditorPerProjectIni);
+			GConfig->SetInt(ConfigSection, GetFormatConfigKey(ChannelCount), static_cast<int32>(Options.Format), GEditorPerProjectIni);
 		}
 
-		FText SizeText(int32 Size)
+		FText FormatResolution(int32 Resolution)
 		{
-			const FText Number = FText::AsNumber(Size, &FNumberFormattingOptions::DefaultNoGrouping());
+			const FText Number = FText::AsNumber(Resolution, &FNumberFormattingOptions::DefaultNoGrouping());
 			return FText::Format(LOCTEXT("SizeItem", "{0} x {0}"), Number);
 		}
 
-		/** The options dialog. Returns false if cancelled. */
-		bool AskOptions(const FText& What, int32 Width, FOptions& InOutOptions)
+		FText DescribeChannels(int32 ChannelCount)
 		{
-			TSharedRef<FOptions> State = MakeShared<FOptions>(InOutOptions);
-			TSharedRef<bool> bExport = MakeShared<bool>(false);
-
-			TSharedRef<TArray<TSharedPtr<int32>>> SizeItems = MakeShared<TArray<TSharedPtr<int32>>>();
-			TSharedPtr<int32> InitialSize;
-			for (const int32 Size : Sizes)
+			switch (ChannelCount)
 			{
-				SizeItems->Add(MakeShared<int32>(Size));
-				if (Size == State->Size)
+			case 1:  return LOCTEXT("ChannelsScalar", "A single value: stored as a grayscale texture.");
+			case 2:  return LOCTEXT("ChannelsRG", "Two channels: stored in R and G (B is 0).");
+			case 4:  return LOCTEXT("ChannelsRGBA", "RGBA: all four channels, alpha included.");
+			default: return LOCTEXT("ChannelsRGB", "RGB.");
+			}
+		}
+
+		/** The options dialog. Returns false if cancelled. */
+		bool AskExportOptions(const FText& ExportName, int32 ChannelCount, FExportOptions& InOutOptions)
+		{
+			TSharedRef<FExportOptions> DialogOptions = MakeShared<FExportOptions>(InOutOptions);
+			TSharedRef<bool> bConfirmed = MakeShared<bool>(false);
+
+			TSharedRef<TArray<TSharedPtr<int32>>> ResolutionItems = MakeShared<TArray<TSharedPtr<int32>>>();
+			TSharedPtr<int32> InitialResolution;
+			for (const int32 Resolution : Resolutions)
+			{
+				ResolutionItems->Add(MakeShared<int32>(Resolution));
+				if (Resolution == DialogOptions->Resolution)
 				{
-					InitialSize = SizeItems->Last();
+					InitialResolution = ResolutionItems->Last();
 				}
 			}
-			if (!InitialSize)
+			if (!InitialResolution)
 			{
-				State->Size = 1024;
-				InitialSize = (*SizeItems)[3];
+				DialogOptions->Resolution = DefaultResolution;
+				InitialResolution = *ResolutionItems->FindByPredicate([](const TSharedPtr<int32>& Item) { return *Item == DefaultResolution; });
 			}
 
 			TSharedRef<SWindow> Window = SNew(SWindow)
@@ -169,26 +192,26 @@ namespace VrrExportNode
 				.SizingRule(ESizingRule::Autosized)
 				.SupportsMinimize(false)
 				.SupportsMaximize(false);
+			const TWeakPtr<SWindow> WeakWindow = Window;
+			auto CloseWindow = [WeakWindow]()
+			{
+				if (TSharedPtr<SWindow> PinnedWindow = WeakWindow.Pin())
+				{
+					PinnedWindow->RequestDestroyWindow();
+				}
+			};
 
-			auto FormatOption = [State](EFormat Format, const FText& Label, const FText& ToolTip) -> TSharedRef<SWidget>
+			auto MakeFormatOption = [DialogOptions](EFormat Format, const FText& Label, const FText& ToolTip) -> TSharedRef<SWidget>
 			{
 				return SNew(SCheckBox)
 					.Style(FAppStyle::Get(), "RadioButton")
 					.ToolTipText(ToolTip)
-					.IsChecked_Lambda([State, Format]() { return State->Format == Format ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State, Format](ECheckBoxState) { State->Format = Format; })
+					.IsChecked_Lambda([DialogOptions, Format]() { return DialogOptions->Format == Format ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([DialogOptions, Format](ECheckBoxState) { DialogOptions->Format = Format; })
 					[
 						SNew(STextBlock).Text(Label)
 					];
 			};
-
-			const FText ChannelsText = Width == 4
-				? LOCTEXT("ChannelsRGBA", "RGBA: all four channels, alpha included.")
-				: Width == 1
-				? LOCTEXT("ChannelsScalar", "A single value: stored as a grayscale texture.")
-				: Width == 2
-				? LOCTEXT("ChannelsRG", "Two channels: stored in R and G (B is 0).")
-				: LOCTEXT("ChannelsRGB", "RGB.");
 
 			Window->SetContent(
 				SNew(SBorder)
@@ -198,11 +221,11 @@ namespace VrrExportNode
 					SNew(SVerticalBox)
 					+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
 					[
-						SNew(STextBlock).Text(What).Font(FAppStyle::GetFontStyle("BoldFont"))
+						SNew(STextBlock).Text(ExportName).Font(FAppStyle::GetFontStyle("BoldFont"))
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 12.0f)
 					[
-						SNew(STextBlock).Text(ChannelsText)
+						SNew(STextBlock).Text(DescribeChannels(ChannelCount))
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 12.0f)
 					[
@@ -214,12 +237,18 @@ namespace VrrExportNode
 						+ SHorizontalBox::Slot().AutoWidth()
 						[
 							SNew(SComboBox<TSharedPtr<int32>>)
-							.OptionsSource(&SizeItems.Get())
-							.InitiallySelectedItem(InitialSize)
-							.OnGenerateWidget_Lambda([](TSharedPtr<int32> Item) { return SNew(STextBlock).Text(SizeText(*Item)); })
-							.OnSelectionChanged_Lambda([State](TSharedPtr<int32> Item, ESelectInfo::Type) { if (Item) { State->Size = *Item; } })
+							.OptionsSource(&ResolutionItems.Get())
+							.InitiallySelectedItem(InitialResolution)
+							.OnGenerateWidget_Lambda([](TSharedPtr<int32> Item) { return SNew(STextBlock).Text(FormatResolution(*Item)); })
+							.OnSelectionChanged_Lambda([DialogOptions](TSharedPtr<int32> Item, ESelectInfo::Type)
+							{
+								if (Item)
+								{
+									DialogOptions->Resolution = *Item;
+								}
+							})
 							[
-								SNew(STextBlock).Text_Lambda([State]() { return SizeText(State->Size); })
+								SNew(STextBlock).Text_Lambda([DialogOptions]() { return FormatResolution(DialogOptions->Resolution); })
 							]
 						]
 					]
@@ -229,17 +258,17 @@ namespace VrrExportNode
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 2.0f)
 					[
-						FormatOption(EFormat::Color, LOCTEXT("FormatColor", "Color (sRGB, 8-bit)"),
+						MakeFormatOption(EFormat::Color, LOCTEXT("FormatColor", "Color (sRGB, 8-bit)"),
 							LOCTEXT("FormatColorTip", "For colors. Stored as sRGB, so sampling it gives the node's values back. Values are clamped to 0-1."))
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 2.0f)
 					[
-						FormatOption(EFormat::Linear, LOCTEXT("FormatLinear", "Linear data (8-bit)"),
+						MakeFormatOption(EFormat::Linear, LOCTEXT("FormatLinear", "Linear data (8-bit)"),
 							LOCTEXT("FormatLinearTip", "For masks, gradients, noise and other 0-1 data. sRGB off. Values are clamped to 0-1."))
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(8.0f, 2.0f, 8.0f, 12.0f)
 					[
-						FormatOption(EFormat::HDR, LOCTEXT("FormatHDR", "HDR (16-bit float)"),
+						MakeFormatOption(EFormat::HDR, LOCTEXT("FormatHDR", "HDR (16-bit float)"),
 							LOCTEXT("FormatHDRTip", "Keeps values below 0 and above 1 (offsets, heights, emissive). Larger on disk."))
 					]
 					+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 12.0f)
@@ -259,10 +288,10 @@ namespace VrrExportNode
 							SNew(SButton)
 							.HAlign(HAlign_Center)
 							.Text(LOCTEXT("ExportButton", "Export..."))
-							.OnClicked_Lambda([bExport, WeakWindow = TWeakPtr<SWindow>(Window)]()
+							.OnClicked_Lambda([bConfirmed, CloseWindow]()
 							{
-								*bExport = true;
-								if (TSharedPtr<SWindow> W = WeakWindow.Pin()) { W->RequestDestroyWindow(); }
+								*bConfirmed = true;
+								CloseWindow();
 								return FReply::Handled();
 							})
 						]
@@ -271,9 +300,9 @@ namespace VrrExportNode
 							SNew(SButton)
 							.HAlign(HAlign_Center)
 							.Text(LOCTEXT("CancelButton", "Cancel"))
-							.OnClicked_Lambda([WeakWindow = TWeakPtr<SWindow>(Window)]()
+							.OnClicked_Lambda([CloseWindow]()
 							{
-								if (TSharedPtr<SWindow> W = WeakWindow.Pin()) { W->RequestDestroyWindow(); }
+								CloseWindow();
 								return FReply::Handled();
 							})
 						]
@@ -281,221 +310,189 @@ namespace VrrExportNode
 				]);
 
 			FSlateApplication::Get().AddModalWindow(Window, FSlateApplication::Get().GetActiveTopLevelWindow());
-			if (*bExport)
+			if (*bConfirmed)
 			{
-				InOutOptions = *State;
+				InOutOptions = *DialogOptions;
 			}
-			return *bExport;
+			return *bConfirmed;
 		}
 
-		/** Letters, digits and single underscores. */
-		FString CleanName(const FString& In)
+		/** Letters and digits, with runs of anything else turned into a single underscore. */
+		FString ToAssetNamePart(const FString& Text)
 		{
-			FString Out;
-			for (const TCHAR C : In)
+			FString NamePart;
+			for (const TCHAR Character : Text)
 			{
-				if (FChar::IsAlnum(C))
+				if (FChar::IsAlnum(Character))
 				{
-					Out.AppendChar(C);
+					NamePart.AppendChar(Character);
 				}
-				else if (!Out.IsEmpty() && !Out.EndsWith(TEXT("_")))
+				else if (!NamePart.IsEmpty() && !NamePart.EndsWith(TEXT("_")))
 				{
-					Out.AppendChar(TEXT('_'));
+					NamePart.AppendChar(TEXT('_'));
 				}
 			}
-			Out.RemoveFromEnd(TEXT("_"));
-			return Out;
+			NamePart.RemoveFromEnd(TEXT("_"));
+			return NamePart;
+		}
+
+		/** T_<Material or function>_<Node>[_<Output>], with the asset's "M_" or "MF_" prefix dropped. */
+		FString MakeDefaultTextureName(const UObject* EditedAsset, const FText& NodeTitle, const FOutput& Output)
+		{
+			FString AssetName = EditedAsset->GetName();
+			AssetName.RemoveFromStart(TEXT("MF_"));
+			AssetName.RemoveFromStart(TEXT("M_"));
+			FString TextureName = TEXT("T_") + ToAssetNamePart(AssetName) + TEXT("_") + ToAssetNamePart(NodeTitle.ToString().Left(32));
+			if (!Output.Label.EqualTo(NodeTitle))
+			{
+				TextureName += TEXT("_") + ToAssetNamePart(Output.Label.ToString());
+			}
+			return TextureName;
 		}
 
 		/** Asks where to save the texture. Returns false if cancelled. */
-		bool AskForTexturePath(const UObject* OriginalMaterial, const FString& DefaultName, FString& OutObjectPath)
+		bool AskTextureObjectPath(const UObject* EditedAsset, const FString& DefaultName, FString& OutObjectPath)
 		{
-			const FString MaterialPackage = OriginalMaterial->GetOutermost()->GetName();
-
-			FSaveAssetDialogConfig Config;
-			Config.DialogTitleOverride = LOCTEXT("SaveTitle", "Save Node Texture");
-			Config.DefaultPath = FPackageName::GetLongPackagePath(MaterialPackage);
-			Config.DefaultAssetName = DefaultName;
-			Config.AssetClassNames.Add(UTexture2D::StaticClass()->GetClassPathName());
-			Config.ExistingAssetPolicy = ESaveAssetDialogExistingAssetPolicy::AllowButWarn;	// re-exporting updates the texture
+			FSaveAssetDialogConfig DialogConfig;
+			DialogConfig.DialogTitleOverride = LOCTEXT("SaveTitle", "Save Node Texture");
+			DialogConfig.DefaultPath = FPackageName::GetLongPackagePath(EditedAsset->GetOutermost()->GetName());
+			DialogConfig.DefaultAssetName = DefaultName;
+			DialogConfig.AssetClassNames.Add(UTexture2D::StaticClass()->GetClassPathName());
+			DialogConfig.ExistingAssetPolicy = ESaveAssetDialogExistingAssetPolicy::AllowButWarn;	// re-exporting updates the texture
 
 			IContentBrowserSingleton& ContentBrowser = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser").Get();
-			OutObjectPath = ContentBrowser.CreateModalSaveAssetDialog(Config);
+			OutObjectPath = ContentBrowser.CreateModalSaveAssetDialog(DialogConfig);
 			return !OutObjectPath.IsEmpty();
 		}
 
-		/** The copy of Node among Expressions (copies keep their names), or null. */
-		template <typename TExpressions>
-		UMaterialExpression* FindCopy(const TExpressions& Expressions, const UMaterialExpression* Node)
+		/** The copy of Original among Expressions (duplicated expressions keep their names), or null. */
+		template <typename TExpressionRange>
+		UMaterialExpression* FindCopiedExpression(const TExpressionRange& Expressions, const UMaterialExpression* Original)
 		{
-			for (UMaterialExpression* E : Expressions)
+			for (UMaterialExpression* Candidate : Expressions)
 			{
-				if (E && E->GetFName() == Node->GetFName())
+				if (Candidate && Candidate->GetFName() == Original->GetFName())
 				{
-					return E;
+					return Candidate;
 				}
 			}
 			return nullptr;
 		}
 
-		UObject* KeepTransient(UObject* Object)
+		/** Marks a bake object transient and roots it: nothing else references it while the progress dialog lets the editor tick. */
+		void RootAsTransient(UObject* Object)
 		{
 			Object->SetFlags(RF_Transient);
-			Object->AddToRoot();	// nothing else references it while the progress dialog lets the editor tick
-			return Object;
+			Object->AddToRoot();
 		}
 
-		/** The material the node is baked from, with its value wired to an Unlit output. */
-		class FBake
+		/** A transient Unlit material whose emissive is the exported value, and the code that renders it to pixels. */
+		class FNodeBaker
 		{
 		public:
 			/** Node is in a material: bake from a copy of the material being edited. */
-			bool InitFromMaterial(UMaterial* EditedMaterial, const UMaterialExpression* Node, int32 InOutput, FText& OutError)
+			bool InitFromMaterial(UMaterial* EditedMaterial, const UMaterialExpression* Node, int32 OutputIndex, FText& OutError)
 			{
-				Material = DuplicateObject<UMaterial>(EditedMaterial, GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UMaterial::StaticClass(), TEXT("VrrNodeBake")));
-				KeepTransient(Material);
-				Expression = FindCopy(Material->GetExpressions(), Node);
-				Output = InOutput;
-				if (!Expression)
+				BakeMaterial = DuplicateObject<UMaterial>(EditedMaterial, GetTransientPackage(),
+					MakeUniqueObjectName(GetTransientPackage(), UMaterial::StaticClass(), TEXT("VrrNodeBake")));
+				RootAsTransient(BakeMaterial);
+				ValueExpression = FindCopiedExpression(BakeMaterial->GetExpressions(), Node);
+				ValueOutputIndex = OutputIndex;
+				if (!ValueExpression)
 				{
 					OutError = LOCTEXT("NodeNotFound", "Couldn't find the node in a copy of the material.");
 					return false;
 				}
-				return MakeUnlit();
+				MakeUnlitSurface();
+				return true;
 			}
 
 			/**
-			 * Node is in a material function: copy the function, give the copy an extra output fed by the node, and
-			 * call it from a new material. Called like any function, its inputs use their preview values only when
-			 * "Use Preview Value as Default" is on (see FunctionInputsWithoutDefault).
+			 * Node is in a material function: copy the function, give the copy an extra output fed by the node, and call
+			 * it from a new material. Like any call, its inputs only have values when "Use Preview Value as Default" is
+			 * on (see FindFunctionInputsWithoutDefault).
 			 */
-			bool InitFromFunction(UMaterialFunction* EditedFunction, const UMaterialExpression* Node, int32 InOutput, FText& OutError)
+			bool InitFromFunction(UMaterialFunction* EditedFunction, const UMaterialExpression* Node, int32 OutputIndex, FText& OutError)
 			{
-				Function = DuplicateObject<UMaterialFunction>(EditedFunction, GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UMaterialFunction::StaticClass(), TEXT("VrrNodeBakeFunction")));
-				KeepTransient(Function);
-				UMaterialExpression* Copy = FindCopy(Function->GetExpressions(), Node);
-				if (!Copy)
+				BakeFunction = DuplicateObject<UMaterialFunction>(EditedFunction, GetTransientPackage(),
+					MakeUniqueObjectName(GetTransientPackage(), UMaterialFunction::StaticClass(), TEXT("VrrNodeBakeFunction")));
+				RootAsTransient(BakeFunction);
+				UMaterialExpression* CopiedNode = FindCopiedExpression(BakeFunction->GetExpressions(), Node);
+				if (!CopiedNode)
 				{
 					OutError = LOCTEXT("FunctionNodeNotFound", "Couldn't find the node in a copy of the function.");
 					return false;
 				}
 				UMaterialExpressionFunctionOutput* BakeOutput = Cast<UMaterialExpressionFunctionOutput>(
-					UMaterialEditingLibrary::CreateMaterialExpressionInFunction(Function, UMaterialExpressionFunctionOutput::StaticClass()));
+					UMaterialEditingLibrary::CreateMaterialExpressionInFunction(BakeFunction, UMaterialExpressionFunctionOutput::StaticClass()));
 				BakeOutput->OutputName = TEXT("VrrBakeOutput");
 				BakeOutput->SortPriority = TNumericLimits<int32>::Max();
-				BakeOutput->A.Connect(InOutput, Copy);
+				BakeOutput->A.Connect(OutputIndex, CopiedNode);
 
-				Material = NewObject<UMaterial>(GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UMaterial::StaticClass(), TEXT("VrrNodeBake")));
-				KeepTransient(Material);
-				UMaterialExpressionMaterialFunctionCall* Call = Cast<UMaterialExpressionMaterialFunctionCall>(
-					UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionMaterialFunctionCall::StaticClass()));
-				Call->SetMaterialFunction(Function);
-				for (int32 Index = 0; Index < Call->FunctionOutputs.Num(); ++Index)
+				BakeMaterial = NewObject<UMaterial>(GetTransientPackage(), MakeUniqueObjectName(GetTransientPackage(), UMaterial::StaticClass(), TEXT("VrrNodeBake")));
+				RootAsTransient(BakeMaterial);
+				UMaterialExpressionMaterialFunctionCall* FunctionCall = Cast<UMaterialExpressionMaterialFunctionCall>(
+					UMaterialEditingLibrary::CreateMaterialExpression(BakeMaterial, UMaterialExpressionMaterialFunctionCall::StaticClass()));
+				FunctionCall->SetMaterialFunction(BakeFunction);
+				for (int32 CallOutputIndex = 0; CallOutputIndex < FunctionCall->FunctionOutputs.Num(); ++CallOutputIndex)
 				{
-					if (Call->FunctionOutputs[Index].ExpressionOutput == BakeOutput)
+					if (FunctionCall->FunctionOutputs[CallOutputIndex].ExpressionOutput == BakeOutput)
 					{
-						Expression = Call;
-						Output = Index;
+						ValueExpression = FunctionCall;
+						ValueOutputIndex = CallOutputIndex;
+						break;
 					}
 				}
-				if (!Expression)
+				if (!ValueExpression)
 				{
 					OutError = LOCTEXT("FunctionCallFailed", "Couldn't call a copy of the function.");
 					return false;
 				}
-				return MakeUnlit();
-			}
-
-		private:
-			/** An opaque Unlit surface whose only wired output is the value. */
-			bool MakeUnlit()
-			{
-				Material->MaterialDomain = MD_Surface;
-				Material->BlendMode = BLEND_Opaque;
-				// SetShadingModel ensures the OLD model is below MSM_NUM, which "From Material Expression" isn't (seen
-				// without Substrate), so clear the private field first.
-				if (FByteProperty* ShadingModelProperty = FindFProperty<FByteProperty>(UMaterial::StaticClass(), TEXT("ShadingModel")))
-				{
-					*ShadingModelProperty->ContainerPtrToValuePtr<uint8>(Material) = MSM_Unlit;
-				}
-				Material->SetShadingModel(MSM_Unlit);
-				Material->bUseMaterialAttributes = false;
-				for (int32 Property = 0; Property < MP_MAX; ++Property)
-				{
-					FMaterialInputDescription Description;
-					if (Material->GetExpressionInputDescription(static_cast<EMaterialProperty>(Property), Description) && Description.Input)
-					{
-						Description.Input->Expression = nullptr;
-					}
-				}
-				if (Substrate::IsSubstrateEnabled())
-				{
-					Unlit = Cast<UMaterialExpressionSubstrateUnlitBSDF>(UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionSubstrateUnlitBSDF::StaticClass()));
-					Material->GetEditorOnlyData()->FrontMaterial.Connect(0, Unlit);
-				}
+				MakeUnlitSurface();
 				return true;
 			}
 
-		public:
-			/** Draws the value (or only its alpha) into Pixels. */
-			bool Render(bool bAlpha, int32 Size, TArray<FLinearColor>& Pixels, FText& OutError)
+			~FNodeBaker()
 			{
-				UMaterialExpression* Source = Expression;
-				int32 SourceOutput = Output;
-				if (bAlpha)
+				for (UObject* BakeObject : { static_cast<UObject*>(BakeMaterial), static_cast<UObject*>(BakeFunction) })
 				{
-					if (!AlphaMask)
+					if (BakeObject)
 					{
-						AlphaMask = Cast<UMaterialExpressionComponentMask>(UMaterialEditingLibrary::CreateMaterialExpression(Material, UMaterialExpressionComponentMask::StaticClass()));
-						AlphaMask->R = AlphaMask->G = AlphaMask->B = false;
-						AlphaMask->A = true;
-						AlphaMask->Input.Connect(Output, Expression);
+						BakeObject->RemoveFromRoot();
+						BakeObject->MarkAsGarbage();
 					}
-					Source = AlphaMask;
-					SourceOutput = 0;
 				}
-				if (Unlit)
-				{
-					Unlit->EmissiveColor.Connect(SourceOutput, Source);
-				}
-				else
-				{
-					// The material editor's copy sets UseConstant on unconnected outputs, and a constant wins over a
-					// connected expression, so without this the bake compiles the constant (black) instead of the node.
-					FColorMaterialInput& Emissive = Material->GetEditorOnlyData()->EmissiveColor;
-					Emissive.UseConstant = false;
-					Emissive.Connect(SourceOutput, Source);
-				}
+			}
 
-				UMaterialEditingLibrary::RecompileMaterial(Material);
-				if (GShaderCompilingManager)
-				{
-					GShaderCompilingManager->FinishAllCompilation();
-				}
+			/** Draws the value, or only its alpha, into OutPixels (Resolution x Resolution, linear floats). */
+			bool RenderPixels(bool bAlphaOnly, int32 Resolution, TArray<FLinearColor>& OutPixels, FText& OutError)
+			{
+				ConnectEmissive(bAlphaOnly);
+				UMaterialEditingLibrary::RecompileMaterial(BakeMaterial);
 
-				UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-				if (!World)
+				UWorld* EditorWorld = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+				if (!EditorWorld)
 				{
 					OutError = LOCTEXT("NoWorld", "There's no editor world to render in.");
 					return false;
 				}
-				if (!CheckShaders(World, OutError))
+				if (!ValidateShaders(EditorWorld, OutError))
 				{
 					return false;
 				}
-				PrepareTextures();
+				LoadSampledTextures();
 
-				UTextureRenderTarget2D* Target = UKismetRenderingLibrary::CreateRenderTarget2D(World, Size, Size, RTF_RGBA32f, FLinearColor::Black, false);
-				if (!Target)
+				UTextureRenderTarget2D* RenderTarget = UKismetRenderingLibrary::CreateRenderTarget2D(EditorWorld, Resolution, Resolution, RTF_RGBA32f, FLinearColor::Black, false);
+				if (!RenderTarget)
 				{
 					OutError = LOCTEXT("NoTarget", "Couldn't create the render target.");
 					return false;
 				}
-				UKismetRenderingLibrary::DrawMaterialToRenderTarget(World, Target, Material);
-				FTextureRenderTargetResource* TargetResource = Target->GameThread_GetRenderTargetResource();
-				const bool bRead = TargetResource && TargetResource->ReadLinearColorPixels(Pixels);	// RCM_MinMax: values outside 0-1 kept
-				Target->MarkAsGarbage();
-				if (!bRead || Pixels.Num() != Size * Size)
+				UKismetRenderingLibrary::DrawMaterialToRenderTarget(EditorWorld, RenderTarget, BakeMaterial);
+				FTextureRenderTargetResource* RenderTargetResource = RenderTarget->GameThread_GetRenderTargetResource();
+				const bool bPixelsRead = RenderTargetResource && RenderTargetResource->ReadLinearColorPixels(OutPixels);	// RCM_MinMax keeps values outside 0-1
+				RenderTarget->MarkAsGarbage();
+				if (!bPixelsRead || OutPixels.Num() != Resolution * Resolution)
 				{
 					OutError = LOCTEXT("ReadFailed", "Couldn't read the rendered pixels back.");
 					return false;
@@ -503,151 +500,248 @@ namespace VrrExportNode
 				return true;
 			}
 
-			/** Likely reasons for a black bake, found while baking (shown if the result is black). */
-			const TArray<FString>& GetNotes() const { return Notes; }
-
-			~FBake()
+			/** Likely reasons for a black result, found while baking. Shown if the result is black. */
+			const TArray<FString>& GetBlackResultHints() const
 			{
-				for (UObject* Object : { static_cast<UObject*>(Material), static_cast<UObject*>(Function) })
-				{
-					if (Object)
-					{
-						Object->RemoveFromRoot();
-						Object->MarkAsGarbage();
-					}
-				}
+				return BlackResultHints;
 			}
 
 		private:
+			/** Turns the bake material into an opaque Unlit surface with nothing wired yet. */
+			void MakeUnlitSurface()
+			{
+				BakeMaterial->MaterialDomain = MD_Surface;
+				BakeMaterial->BlendMode = BLEND_Opaque;
+				// SetShadingModel ensures the material's previous model is below MSM_NUM. "From Material Expression" isn't
+				// (seen without Substrate), so set the private field directly first.
+				if (FByteProperty* ShadingModelProperty = FindFProperty<FByteProperty>(UMaterial::StaticClass(), TEXT("ShadingModel")))
+				{
+					*ShadingModelProperty->ContainerPtrToValuePtr<uint8>(BakeMaterial) = MSM_Unlit;
+				}
+				BakeMaterial->SetShadingModel(MSM_Unlit);
+				BakeMaterial->bUseMaterialAttributes = false;
+				for (int32 PropertyIndex = 0; PropertyIndex < MP_MAX; ++PropertyIndex)
+				{
+					FMaterialInputDescription InputDescription;
+					if (BakeMaterial->GetExpressionInputDescription(static_cast<EMaterialProperty>(PropertyIndex), InputDescription) && InputDescription.Input)
+					{
+						InputDescription.Input->Expression = nullptr;
+					}
+				}
+
+				if (Substrate::IsSubstrateEnabled())
+				{
+					UnlitBSDF = Cast<UMaterialExpressionSubstrateUnlitBSDF>(
+						UMaterialEditingLibrary::CreateMaterialExpression(BakeMaterial, UMaterialExpressionSubstrateUnlitBSDF::StaticClass()));
+					BakeMaterial->GetEditorOnlyData()->FrontMaterial.Connect(0, UnlitBSDF);
+				}
+				else
+				{
+					// The material editor's copy sets UseConstant on unconnected outputs, and a constant wins over a
+					// connected expression, so the bake would compile the constant (black) instead of the node.
+					BakeMaterial->GetEditorOnlyData()->EmissiveColor.UseConstant = false;
+				}
+			}
+
+			/** Wires the value, or a mask of its alpha, into the Unlit emissive. */
+			void ConnectEmissive(bool bAlphaOnly)
+			{
+				UMaterialExpression* SourceExpression = ValueExpression;
+				int32 SourceOutputIndex = ValueOutputIndex;
+				if (bAlphaOnly)
+				{
+					if (!AlphaMask)
+					{
+						AlphaMask = Cast<UMaterialExpressionComponentMask>(
+							UMaterialEditingLibrary::CreateMaterialExpression(BakeMaterial, UMaterialExpressionComponentMask::StaticClass()));
+						AlphaMask->R = false;
+						AlphaMask->G = false;
+						AlphaMask->B = false;
+						AlphaMask->A = true;
+						AlphaMask->Input.Connect(ValueOutputIndex, ValueExpression);
+					}
+					SourceExpression = AlphaMask;
+					SourceOutputIndex = 0;
+				}
+				FExpressionInput& Emissive = UnlitBSDF ? UnlitBSDF->EmissiveColor : BakeMaterial->GetEditorOnlyData()->EmissiveColor;
+				Emissive.Connect(SourceOutputIndex, SourceExpression);
+			}
+
 			/**
-			 * The bake material must have shaders on the editor's highest platform and on the one the editor world draws
-			 * with. They differ under a Preview Rendering Level, and a material missing there is silently drawn with
-			 * the default material (black emissive).
+			 * The bake material needs shaders on the platform the editor world draws with and on the editor's highest
+			 * one. They differ under a Preview Rendering Level, and a material without shaders there is silently drawn
+			 * as the default material (black emissive). Waits for this material's shaders only.
 			 */
-			bool CheckShaders(UWorld* World, FText& OutError)
+			bool ValidateShaders(UWorld* EditorWorld, FText& OutError)
 			{
 #if UE_VERSION_OLDER_THAN(5, 7, 0)
-				TArray<ERHIFeatureLevel::Type, TInlineAllocator<2>> Targets;
-				Targets.Add(World->GetFeatureLevel());
-				Targets.AddUnique(GMaxRHIFeatureLevel);
-				auto NameOf = [](ERHIFeatureLevel::Type Level) { FString Name; GetFeatureLevelName(Level, Name); return Name; };
-#else
-				TArray<EShaderPlatform, TInlineAllocator<2>> Targets;
-				Targets.Add(GetFeatureLevelShaderPlatform(World->GetFeatureLevel()));
-				Targets.AddUnique(GMaxRHIShaderPlatform);
-				auto NameOf = [](EShaderPlatform Platform) { return FDataDrivenShaderPlatformInfo::GetName(Platform).ToString(); };
-#endif
-				UE_LOG(LogVrrExportNode, Log, TEXT("Baking %s: world draws with %s, Substrate %s."),
-					*Material->GetName(), *NameOf(Targets[0]), Substrate::IsSubstrateEnabled() ? TEXT("on") : TEXT("off"));
-
-				for (const auto Target : Targets)
+				TArray<ERHIFeatureLevel::Type, TInlineAllocator<2>> ShaderTargets;
+				ShaderTargets.Add(EditorWorld->GetFeatureLevel());
+				ShaderTargets.AddUnique(GMaxRHIFeatureLevel);
+				auto GetTargetName = [](ERHIFeatureLevel::Type FeatureLevel)
 				{
-					FMaterialResource* Resource = Material->GetMaterialResource(Target);
-					const FString Name = NameOf(Target);
+					FString FeatureLevelName;
+					GetFeatureLevelName(FeatureLevel, FeatureLevelName);
+					return FeatureLevelName;
+				};
+#else
+				TArray<EShaderPlatform, TInlineAllocator<2>> ShaderTargets;
+				ShaderTargets.Add(GetFeatureLevelShaderPlatform(EditorWorld->GetFeatureLevel()));
+				ShaderTargets.AddUnique(GMaxRHIShaderPlatform);
+				auto GetTargetName = [](EShaderPlatform ShaderPlatform) { return FDataDrivenShaderPlatformInfo::GetName(ShaderPlatform).ToString(); };
+#endif
+				UE_LOG(LogVrrExportNode, Log, TEXT("Baking %s: the editor world draws with %s, Substrate %s."),
+					*BakeMaterial->GetName(), *GetTargetName(ShaderTargets[0]), Substrate::IsSubstrateEnabled() ? TEXT("on") : TEXT("off"));
+
+				for (const auto ShaderTarget : ShaderTargets)
+				{
+					const FString TargetName = GetTargetName(ShaderTarget);
+					FMaterialResource* Resource = BakeMaterial->GetMaterialResource(ShaderTarget);
 					if (!Resource)
 					{
-						OutError = FText::Format(LOCTEXT("NoResource", "The node wasn't compiled for {0}, which the editor draws with."), FText::FromString(Name));
+						OutError = FText::Format(LOCTEXT("NoResource", "The node wasn't compiled for {0}, which the editor draws with."), FText::FromString(TargetName));
 						return false;
 					}
 					Resource->FinishCompilation();
 					if (!Resource->GetCompileErrors().IsEmpty())
 					{
-						const FString Errors = FString::Join(Resource->GetCompileErrors(), TEXT("\n"));
-						UE_LOG(LogVrrExportNode, Warning, TEXT("Compile errors on %s:\n%s"), *Name, *Errors);
+						const FString CompileErrors = FString::Join(Resource->GetCompileErrors(), TEXT("\n"));
+						UE_LOG(LogVrrExportNode, Warning, TEXT("Compile errors on %s:\n%s"), *TargetName, *CompileErrors);
 						OutError = FText::Format(LOCTEXT("CompileFailed", "The node doesn't compile on its own as an Unlit surface on {0}:\n{1}"),
-							FText::FromString(Name), FText::FromString(Errors));
+							FText::FromString(TargetName), FText::FromString(CompileErrors));
 						return false;
 					}
 					if (!Resource->GetGameThreadShaderMap())
 					{
-						OutError = FText::Format(LOCTEXT("NoShaderMap", "The node has no shaders for {0}, so it would draw as the default material."), FText::FromString(Name));
+						OutError = FText::Format(LOCTEXT("NoShaderMap", "The node has no shaders for {0}, so it would draw as the default material."), FText::FromString(TargetName));
 						return false;
 					}
 					if (!Resource->IsGameThreadShaderMapComplete())
 					{
-						Notes.AddUnique(FString::Printf(TEXT("Shaders for %s are incomplete; the editor may have drawn the default material."), *Name));
+						BlackResultHints.AddUnique(FString::Printf(TEXT("Shaders for %s are incomplete; the editor may have drawn the default material."), *TargetName));
 					}
 				}
 				return true;
 			}
 
-			/** Finishes building the sampled textures and streams in all their mips. */
-			void PrepareTextures()
+			/** Finishes building the sampled textures and streams in all their mips, so the bake doesn't read placeholders. */
+			void LoadSampledTextures()
 			{
-				TArray<UTexture*> Textures;
-				for (UObject* Object : Material->GetReferencedTextures())
+				TArray<UTexture*> SampledTextures;
+				for (UObject* ReferencedObject : BakeMaterial->GetReferencedTextures())
 				{
-					if (UTexture* Texture = Cast<UTexture>(Object))
+					if (UTexture* Texture = Cast<UTexture>(ReferencedObject))
 					{
-						Textures.Add(Texture);
+						SampledTextures.Add(Texture);
 					}
 				}
-				FTextureCompilingManager::Get().FinishCompilation(Textures);	// still building: drawn as a placeholder
-				for (UTexture* Texture : Textures)
+				FTextureCompilingManager::Get().FinishCompilation(SampledTextures);
+				for (UTexture* Texture : SampledTextures)
 				{
 					Texture->SetForceMipLevelsToBeResident(30.0f);
 					Texture->WaitForStreaming();
 					if (Texture->IsCurrentlyVirtualTextured())
 					{
-						Notes.AddUnique(FString::Printf(TEXT("%s is a virtual texture; its pages may not be loaded outside a viewport. Turn off Virtual Texture Streaming on it to bake."),
+						BlackResultHints.AddUnique(FString::Printf(
+							TEXT("%s is a virtual texture; its pages may not be loaded outside a viewport. Turn off Virtual Texture Streaming on it to bake."),
 							*Texture->GetName()));
 					}
 				}
 			}
 
-			UMaterial* Material = nullptr;
-			UMaterialFunction* Function = nullptr;
-			UMaterialExpression* Expression = nullptr;
-			UMaterialExpressionSubstrateUnlitBSDF* Unlit = nullptr;
+			UMaterial* BakeMaterial = nullptr;
+			UMaterialFunction* BakeFunction = nullptr;
+			UMaterialExpression* ValueExpression = nullptr;
+			int32 ValueOutputIndex = 0;
+			UMaterialExpressionSubstrateUnlitBSDF* UnlitBSDF = nullptr;
 			UMaterialExpressionComponentMask* AlphaMask = nullptr;
-			int32 Output = 0;
-			TArray<FString> Notes;
+			TArray<FString> BlackResultHints;
 		};
 
-		/** True when every channel the output has is exactly 0. */
-		bool IsAllBlack(const TArray<FLinearColor>& Pixels, int32 Width)
+		/** Renders the value into OutPixels, alpha included for 4 channels, with unused channels filled in for the texture. */
+		bool BakePixels(FNodeBaker& Baker, int32 ChannelCount, int32 Resolution, FScopedSlowTask& Progress, TArray<FLinearColor>& OutPixels, FText& OutError)
 		{
-			for (const FLinearColor& P : Pixels)
+			Progress.EnterProgressFrame(1.0f, LOCTEXT("BakingColor", "Compiling and rendering the node..."));
+			if (!Baker.RenderPixels(false, Resolution, OutPixels, OutError))
 			{
-				const float Channels[4] = { P.R, P.G, P.B, P.A };
-				for (int32 C = 0; C < FMath::Min(Width, 4); ++C)
+				return false;
+			}
+
+			if (ChannelCount == 4)
+			{
+				Progress.EnterProgressFrame(1.0f, LOCTEXT("BakingAlpha", "Rendering alpha..."));
+				TArray<FLinearColor> AlphaPixels;
+				if (!Baker.RenderPixels(true, Resolution, AlphaPixels, OutError))
 				{
-					if (Channels[C] != 0.0f)
-					{
-						return false;
-					}
+					return false;
+				}
+				for (int32 PixelIndex = 0; PixelIndex < OutPixels.Num(); ++PixelIndex)
+				{
+					OutPixels[PixelIndex].A = AlphaPixels[PixelIndex].R;
+				}
+				return true;
+			}
+
+			for (FLinearColor& Pixel : OutPixels)
+			{
+				Pixel.A = 1.0f;
+				if (ChannelCount == 1)
+				{
+					Pixel.G = Pixel.R;	// grayscale
+					Pixel.B = Pixel.R;
+				}
+				else if (ChannelCount == 2)
+				{
+					Pixel.B = 0.0f;
 				}
 			}
 			return true;
 		}
 
-		/** Asks whether to save a black result anyway, listing likely causes. */
-		bool ConfirmBlack(const FBake& Bake)
+		FValueRange GetValueRange(const TArray<FLinearColor>& Pixels, int32 ChannelCount)
 		{
-			FString Causes = FString::Join(Bake.GetNotes(), TEXT("\n- "));
-			if (!Causes.IsEmpty())
+			FValueRange Range;
+			Range.Min = TNumericLimits<float>::Max();
+			Range.Max = TNumericLimits<float>::Lowest();
+			for (const FLinearColor& Pixel : Pixels)
 			{
-				Causes = TEXT("\n- ") + Causes;
+				for (int32 ChannelIndex = 0; ChannelIndex < FMath::Min(ChannelCount, 4); ++ChannelIndex)
+				{
+					const float Value = Pixel.Component(ChannelIndex);
+					Range.Min = FMath::Min(Range.Min, Value);
+					Range.Max = FMath::Max(Range.Max, Value);
+				}
 			}
-			UE_LOG(LogVrrExportNode, Warning, TEXT("The bake came out black in every channel.%s"), *Causes);
+			return Range;
+		}
+
+		/** Asks whether to save a result that is 0 in every channel, listing likely causes. */
+		bool ConfirmSaveBlackResult(const FNodeBaker& Baker)
+		{
+			FString FoundCauses = FString::Join(Baker.GetBlackResultHints(), TEXT("\n- "));
+			if (!FoundCauses.IsEmpty())
+			{
+				FoundCauses = TEXT("\n- ") + FoundCauses;
+			}
+			UE_LOG(LogVrrExportNode, Warning, TEXT("The bake came out black in every channel.%s"), *FoundCauses);
 			const FText Message = FText::Format(LOCTEXT("BlackResult",
 				"The node rendered black in every channel. That usually means the bake failed rather than the node being black:\n\n"
 				"- It reads something the bake doesn't have (world position, vertex data, scene textures, per-instance data).\n"
-				"- A Preview Rendering Level is set and the node doesn't render there.\n"
 				"- A sampled texture isn't loaded (virtual textures especially).{0}\n\n"
-				"Save the black texture anyway?"), FText::FromString(Causes));
+				"Save the black texture anyway?"), FText::FromString(FoundCauses));
 			return FMessageDialog::Open(EAppMsgType::YesNo, Message, LOCTEXT("BlackResultTitle", "Export Node to Texture")) == EAppReturnType::Yes;
 		}
 
-		/** Writes Pixels into the texture at ObjectPath (created, or updated if it's already a texture). */
-		UTexture2D* WriteTexture(const FString& ObjectPath, int32 Size, int32 Width, EFormat Format, const TArray<FLinearColor>& Pixels, FText& OutError)
+		/** Writes Pixels into the texture at ObjectPath, created or updated in place if it's already a texture. */
+		UTexture2D* WriteTexture(const FString& ObjectPath, const FExportOptions& Options, int32 ChannelCount, const TArray<FLinearColor>& Pixels, FText& OutError)
 		{
 			const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
 			const FString AssetName = FPackageName::GetShortName(PackageName);
+			const int32 Resolution = Options.Resolution;
 
 			UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, *ObjectPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
-			const bool bNew = Texture == nullptr;
-			if (bNew)
+			const bool bNewTexture = Texture == nullptr;
+			if (bNewTexture)
 			{
 				if (FindObject<UObject>(nullptr, *ObjectPath) || FPackageName::DoesPackageExist(PackageName))
 				{
@@ -663,274 +757,232 @@ namespace VrrExportNode
 			}
 
 			Texture->PreEditChange(nullptr);
-			if (Format == EFormat::HDR)
+			if (Options.Format == EFormat::HDR)
 			{
-				TArray<FFloat16Color> Data;
-				Data.Reserve(Pixels.Num());
-				for (const FLinearColor& P : Pixels)
+				TArray<FFloat16Color> SourcePixels;
+				SourcePixels.Reserve(Pixels.Num());
+				for (const FLinearColor& Pixel : Pixels)
 				{
-					Data.Add(FFloat16Color(P));
+					SourcePixels.Add(FFloat16Color(Pixel));
 				}
-				Texture->Source.Init(Size, Size, 1, 1, TSF_RGBA16F, reinterpret_cast<const uint8*>(Data.GetData()));
+				Texture->Source.Init(Resolution, Resolution, 1, 1, TSF_RGBA16F, reinterpret_cast<const uint8*>(SourcePixels.GetData()));
 				Texture->SRGB = false;
-				Texture->CompressionSettings = Width == 1 ? TC_HalfFloat : TC_HDR;
+				Texture->CompressionSettings = ChannelCount == 1 ? TC_HalfFloat : TC_HDR;
 			}
 			else
 			{
-				const bool bSRGB = Format == EFormat::Color;
-				TArray<FColor> Data;
-				Data.Reserve(Pixels.Num());
-				for (const FLinearColor& P : Pixels)
+				const bool bSRGB = Options.Format == EFormat::Color;
+				TArray<FColor> SourcePixels;
+				SourcePixels.Reserve(Pixels.Num());
+				for (const FLinearColor& Pixel : Pixels)
 				{
-					Data.Add(P.ToFColor(bSRGB));	// clamps to 0-1
+					SourcePixels.Add(Pixel.ToFColor(bSRGB));	// clamps to 0-1
 				}
-				Texture->Source.Init(Size, Size, 1, 1, TSF_BGRA8, reinterpret_cast<const uint8*>(Data.GetData()));
+				Texture->Source.Init(Resolution, Resolution, 1, 1, TSF_BGRA8, reinterpret_cast<const uint8*>(SourcePixels.GetData()));
 				Texture->SRGB = bSRGB;
-				Texture->CompressionSettings = bSRGB ? TC_Default : Width == 1 ? TC_Grayscale : TC_Masks;
+				if (bSRGB)
+				{
+					Texture->CompressionSettings = TC_Default;
+				}
+				else
+				{
+					Texture->CompressionSettings = ChannelCount == 1 ? TC_Grayscale : TC_Masks;
+				}
 			}
-			Texture->CompressionNoAlpha = Width < 4;
+			Texture->CompressionNoAlpha = ChannelCount < 4;
 			Texture->PostEditChange();
 			Texture->MarkPackageDirty();
-			if (bNew)
+			if (bNewTexture)
 			{
 				FAssetRegistryModule::AssetCreated(Texture);
 			}
 			return Texture;
 		}
 
-		/** Smallest and largest value over the channels the output has. */
-		void ValueRange(const TArray<FLinearColor>& Pixels, int32 Width, float& OutMin, float& OutMax)
+		void NotifyExported(const UTexture2D* Texture, const FText& ExportName, const FExportOptions& Options, const FValueRange& Range)
 		{
-			OutMin = TNumericLimits<float>::Max();
-			OutMax = TNumericLimits<float>::Lowest();
-			for (const FLinearColor& P : Pixels)
+			FNumberFormattingOptions ThreeDecimals;
+			ThreeDecimals.SetMaximumFractionalDigits(3);
+			FText Message = FText::Format(LOCTEXT("Exported", "Exported {0} to {1} ({2}). Values range {3} to {4}."),
+				ExportName, FText::FromString(Texture->GetName()), FormatResolution(Options.Resolution),
+				FText::AsNumber(Range.Min, &ThreeDecimals), FText::AsNumber(Range.Max, &ThreeDecimals));
+			const bool bClamped = Options.Format != EFormat::HDR && (Range.Min < -0.001f || Range.Max > 1.001f);
+			if (bClamped)
 			{
-				const float Channels[4] = { P.R, P.G, P.B, P.A };
-				for (int32 C = 0; C < FMath::Min(Width, 4); ++C)
-				{
-					OutMin = FMath::Min(OutMin, Channels[C]);
-					OutMax = FMath::Max(OutMax, Channels[C]);
-				}
+				Message = FText::Format(LOCTEXT("Clamped", "{0} Values outside 0-1 were clamped; export as HDR to keep them."), Message);
 			}
+			VrrGraph::Notify(Message, true);
 		}
 	}
 
 	TArray<FOutput> GetExportableOutputs(const UEdGraphNode* Node)
 	{
-		TArray<FOutput> Result;
-		UMaterialExpression* Expression = ExpressionOf(Node);
+		TArray<FOutput> ExportableOutputs;
+		UMaterialExpression* Expression = GetExpression(Node);
 		if (!Expression)
 		{
-			return Result;
+			return ExportableOutputs;
 		}
 		const TArray<FExpressionOutput>& Outputs = Expression->GetOutputs();
-		for (int32 Index = 0; Index < Outputs.Num(); ++Index)
+		for (int32 OutputIndex = 0; OutputIndex < Outputs.Num(); ++OutputIndex)
 		{
-			if ((static_cast<uint64>(Expression->GetOutputValueType(Index)) & NotAValue) != 0)
+			if ((static_cast<uint64>(Expression->GetOutputValueType(OutputIndex)) & NonValueTypes) != 0)
 			{
 				continue;
 			}
-			const VrrReroute::EKind Kind = VrrReroute::InferKind(Expression, Index);
-			if (Kind == VrrReroute::EKind::Bool || Kind == VrrReroute::EKind::Texture || Kind == VrrReroute::EKind::MaterialAttributes || Kind == VrrReroute::EKind::ShadingModel)
+			const VrrReroute::EKind Kind = VrrReroute::InferKind(Expression, OutputIndex);
+			const bool bNonValueKind = Kind == VrrReroute::EKind::Bool || Kind == VrrReroute::EKind::Texture
+				|| Kind == VrrReroute::EKind::MaterialAttributes || Kind == VrrReroute::EKind::ShadingModel;
+			if (bNonValueKind)
 			{
 				continue;
 			}
-			FText Label = FText::FromName(Outputs[Index].OutputName);
-			if (Outputs[Index].OutputName.IsNone())
+			FText Label = FText::FromName(Outputs[OutputIndex].OutputName);
+			if (Outputs[OutputIndex].OutputName.IsNone())
 			{
-				Label = Outputs.Num() == 1 ? Node->GetNodeTitle(ENodeTitleType::ListView) : FText::Format(LOCTEXT("OutputN", "Output {0}"), Index);
+				Label = Outputs.Num() == 1 ? Node->GetNodeTitle(ENodeTitleType::ListView) : FText::Format(LOCTEXT("OutputN", "Output {0}"), OutputIndex);
 			}
-			Result.Add({ Index, Label });
+			ExportableOutputs.Add({ OutputIndex, Label });
 		}
-		return Result;
+		return ExportableOutputs;
 	}
 
-	TArray<FName> FunctionInputsWithoutDefault(const UEdGraphNode* Node)
+	TArray<FName> FindFunctionInputsWithoutDefault(const UEdGraphNode* Node)
 	{
-		TArray<FName> Missing;
-		TSet<UMaterialExpression*> Seen;
-		TArray<UMaterialExpression*> ToVisit;
-		if (UMaterialExpression* Start = ExpressionOf(Node))
+		TArray<FName> InputsWithoutDefault;
+		TSet<UMaterialExpression*> Visited;
+		TArray<UMaterialExpression*> Pending;
+		if (UMaterialExpression* StartExpression = GetExpression(Node))
 		{
-			ToVisit.Add(Start);
+			Pending.Add(StartExpression);
 		}
-		while (!ToVisit.IsEmpty())
+		while (!Pending.IsEmpty())
 		{
-			UMaterialExpression* E = ToVisit.Pop(EAllowShrinking::No);
-			if (!E || Seen.Contains(E))
+			UMaterialExpression* Current = Pending.Pop(EAllowShrinking::No);
+			if (!Current || Visited.Contains(Current))
 			{
 				continue;
 			}
-			Seen.Add(E);
-			if (const UMaterialExpressionFunctionInput* Input = Cast<UMaterialExpressionFunctionInput>(E))
+			Visited.Add(Current);
+			if (const UMaterialExpressionFunctionInput* FunctionInput = Cast<UMaterialExpressionFunctionInput>(Current))
 			{
-				if (!Input->bUsePreviewValueAsDefault)
+				if (!FunctionInput->bUsePreviewValueAsDefault)
 				{
-					Missing.AddUnique(Input->InputName);
+					InputsWithoutDefault.AddUnique(FunctionInput->InputName);
 					continue;	// its preview graph won't be used
 				}
 			}
-			if (const UMaterialExpressionNamedRerouteUsage* Usage = Cast<UMaterialExpressionNamedRerouteUsage>(E))
+			if (const UMaterialExpressionNamedRerouteUsage* RerouteUsage = Cast<UMaterialExpressionNamedRerouteUsage>(Current))
 			{
-				ToVisit.Add(Usage->Declaration);
+				Pending.Add(RerouteUsage->Declaration);
 			}
-			for (FExpressionInputIterator It{ E }; It; ++It)
+			for (FExpressionInputIterator InputIt{ Current }; InputIt; ++InputIt)
 			{
-				ToVisit.Add(It.Input->Expression);
+				Pending.Add(InputIt.Input->Expression);
 			}
 		}
-		return Missing;
+		return InputsWithoutDefault;
 	}
 
-	int32 OutputIndexOfPin(const UEdGraphNode* Node, const UEdGraphPin* Pin)
+	int32 FindOutputIndexOfPin(const UEdGraphNode* Node, const UEdGraphPin* Pin)
 	{
 		const UMaterialGraphNode* MaterialNode = Cast<UMaterialGraphNode>(Node);
 		if (!MaterialNode || !Pin || Pin->Direction != EGPD_Output || !MaterialNode->MaterialExpression)
 		{
 			return INDEX_NONE;
 		}
-		for (int32 Index = 0; Index < MaterialNode->MaterialExpression->GetOutputs().Num(); ++Index)
+		for (int32 OutputIndex = 0; OutputIndex < MaterialNode->MaterialExpression->GetOutputs().Num(); ++OutputIndex)
 		{
-			if (MaterialNode->GetOutputPin(Index) == Pin)
+			if (MaterialNode->GetOutputPin(OutputIndex) == Pin)
 			{
-				return Index;
+				return OutputIndex;
 			}
 		}
 		return INDEX_NONE;
 	}
 
-	void Export(UMaterialGraph* Graph, const UEdGraphNode* Node, int32 Output)
+	void Export(UMaterialGraph* Graph, const UEdGraphNode* Node, int32 OutputIndex)
 	{
-		UMaterialExpression* Expression = ExpressionOf(Node);
-		TSharedPtr<IMaterialEditor> Editor = VrrGraph::GetEditor(Graph);
+		UMaterialExpression* Expression = GetExpression(Node);
+		TSharedPtr<IMaterialEditor> MaterialEditor = VrrGraph::GetEditor(Graph);
 		UMaterialFunction* EditedFunction = Graph ? Graph->MaterialFunction.Get() : nullptr;
-		if (!Graph || (!Graph->Material && !EditedFunction) || !Expression || !Editor)
+		if (!Graph || (!Graph->Material && !EditedFunction) || !Expression || !MaterialEditor)
 		{
 			return;
 		}
 		if (EditedFunction)
 		{
-			const TArray<FName> Missing = FunctionInputsWithoutDefault(Node);
-			if (!Missing.IsEmpty())
+			const TArray<FName> InputsWithoutDefault = FindFunctionInputsWithoutDefault(Node);
+			if (!InputsWithoutDefault.IsEmpty())
 			{
-				TArray<FString> Names;
-				Algo::Transform(Missing, Names, [](FName N) { return N.ToString(); });
+				TArray<FString> InputNames;
+				Algo::Transform(InputsWithoutDefault, InputNames, [](FName InputName) { return InputName.ToString(); });
 				VrrGraph::Notify(FText::Format(LOCTEXT("NoDefault", "Export Node to Texture: turn on \"Use Preview Value as Default\" on function input(s) {0}, which this node reads."),
-					FText::FromString(FString::Join(Names, TEXT(", ")))), false);
+					FText::FromString(FString::Join(InputNames, TEXT(", ")))), false);
 				return;
 			}
 		}
-		const TArray<FOutput> Outputs = GetExportableOutputs(Node);
-		const FOutput* Chosen = Outputs.FindByPredicate([Output](const FOutput& O) { return O.Index == Output; });
-		if (!Chosen)
+		const TArray<FOutput> ExportableOutputs = GetExportableOutputs(Node);
+		const FOutput* Output = ExportableOutputs.FindByPredicate([OutputIndex](const FOutput& Candidate) { return Candidate.Index == OutputIndex; });
+		if (!Output)
 		{
 			return;
 		}
-		const int32 Width = WidthOf(Expression, Output);
+		const int32 ChannelCount = GetChannelCount(Expression, OutputIndex);
 		const FText NodeTitle = Node->GetNodeTitle(ENodeTitleType::ListView);
-		const FText What = Chosen->Label.EqualTo(NodeTitle) ? NodeTitle : FText::Format(LOCTEXT("NodeAndOutput", "{0}: {1}"), NodeTitle, Chosen->Label);
+		const FText ExportName = Output->Label.EqualTo(NodeTitle) ? NodeTitle : FText::Format(LOCTEXT("NodeAndOutput", "{0}: {1}"), NodeTitle, Output->Label);
 
 		// 1. Options
-		FOptions Options = LoadOptions(Width);
-		if (!AskOptions(What, Width, Options))
+		FExportOptions Options = LoadOptions(ChannelCount);
+		if (!AskExportOptions(ExportName, ChannelCount, Options))
 		{
 			return;
 		}
-		SaveOptions(Options, Width);
+		SaveOptions(Options, ChannelCount);
 
-		// 2. Where: T_<Material or function>_<Node>[_<Output>], without its "M_" / "MF_"
-		const TArray<UObject*>* EditingObjects = Editor->GetObjectsCurrentlyBeingEdited();
-		const UObject* OriginalMaterial = EditingObjects && EditingObjects->Num() > 0 ? (*EditingObjects)[0] : Graph->GetMaterialOrFunction();
-		FString MaterialName = OriginalMaterial->GetName();
-		MaterialName.RemoveFromStart(TEXT("MF_"));
-		MaterialName.RemoveFromStart(TEXT("M_"));
-		FString DefaultName = TEXT("T_") + CleanName(MaterialName) + TEXT("_") + CleanName(NodeTitle.ToString().Left(32));
-		if (!Chosen->Label.EqualTo(NodeTitle))
-		{
-			DefaultName += TEXT("_") + CleanName(Chosen->Label.ToString());
-		}
-		FString ObjectPath;
-		if (!AskForTexturePath(OriginalMaterial, DefaultName, ObjectPath))
+		// 2. Destination, named after the asset (not the editor's transient copy)
+		const TArray<UObject*>* EditedObjects = MaterialEditor->GetObjectsCurrentlyBeingEdited();
+		const UObject* EditedAsset = EditedObjects && EditedObjects->Num() > 0 ? (*EditedObjects)[0] : Graph->GetMaterialOrFunction();
+		FString TextureObjectPath;
+		if (!AskTextureObjectPath(EditedAsset, MakeDefaultTextureName(EditedAsset, NodeTitle, *Output), TextureObjectPath))
 		{
 			return;
 		}
 
 		// 3. Bake
-		FScopedSlowTask Task(Width == 4 ? 3.0f : 2.0f, LOCTEXT("Baking", "Exporting node to texture..."));
-		Task.MakeDialog();
+		const float ProgressSteps = ChannelCount == 4 ? 3.0f : 2.0f;
+		FScopedSlowTask Progress(ProgressSteps, LOCTEXT("Baking", "Exporting node to texture..."));
+		Progress.MakeDialog();
+		FNodeBaker Baker;
 		FText Error;
-		FBake Bake;
 		TArray<FLinearColor> Pixels;
-		Task.EnterProgressFrame(1.0f, LOCTEXT("BakingColor", "Compiling and rendering the node..."));
-		const bool bReady = EditedFunction
-			? Bake.InitFromFunction(EditedFunction, Expression, Output, Error)
-			: Bake.InitFromMaterial(Graph->Material, Expression, Output, Error);
-		bool bOk = bReady && Bake.Render(false, Options.Size, Pixels, Error);
-		if (bOk && Width == 4)
+		const bool bBakerReady = EditedFunction
+			? Baker.InitFromFunction(EditedFunction, Expression, OutputIndex, Error)
+			: Baker.InitFromMaterial(Graph->Material, Expression, OutputIndex, Error);
+		if (!bBakerReady || !BakePixels(Baker, ChannelCount, Options.Resolution, Progress, Pixels, Error))
 		{
-			Task.EnterProgressFrame(1.0f, LOCTEXT("BakingAlpha", "Rendering alpha..."));
-			TArray<FLinearColor> Alpha;
-			bOk = Bake.Render(true, Options.Size, Alpha, Error);
-			for (int32 I = 0; bOk && I < Pixels.Num(); ++I)
-			{
-				Pixels[I].A = Alpha[I].R;
-			}
+			VrrGraph::Notify(FText::Format(LOCTEXT("ExportFailed", "Export Node to Texture failed: {0}"), Error), false);
+			return;
 		}
-		else
-		{
-			for (FLinearColor& P : Pixels)
-			{
-				P.A = 1.0f;
-			}
-		}
-		if (bOk && Width == 1)
-		{
-			for (FLinearColor& P : Pixels)
-			{
-				P.G = P.B = P.R;
-			}
-		}
-		else if (bOk && Width == 2)
-		{
-			for (FLinearColor& P : Pixels)
-			{
-				P.B = 0.0f;
-			}
-		}
-
-		if (bOk && IsAllBlack(Pixels, Width) && !ConfirmBlack(Bake))
+		const FValueRange Range = GetValueRange(Pixels, ChannelCount);
+		const bool bAllBlack = Range.Min == 0.0f && Range.Max == 0.0f;
+		if (bAllBlack && !ConfirmSaveBlackResult(Baker))
 		{
 			VrrGraph::Notify(LOCTEXT("BlackCancelled", "Export Node to Texture: the node rendered black, so nothing was saved. See the Output Log (LogVrrExportNode)."), false);
 			return;
 		}
 
 		// 4. Write
-		UTexture2D* Texture = nullptr;
-		if (bOk)
-		{
-			Task.EnterProgressFrame(1.0f, LOCTEXT("Writing", "Writing the texture..."));
-			Texture = WriteTexture(ObjectPath, Options.Size, Width, Options.Format, Pixels, Error);
-		}
+		Progress.EnterProgressFrame(1.0f, LOCTEXT("Writing", "Writing the texture..."));
+		UTexture2D* Texture = WriteTexture(TextureObjectPath, Options, ChannelCount, Pixels, Error);
 		if (!Texture)
 		{
 			VrrGraph::Notify(FText::Format(LOCTEXT("ExportFailed", "Export Node to Texture failed: {0}"), Error), false);
 			return;
 		}
-
 		IContentBrowserSingleton& ContentBrowser = FModuleManager::LoadModuleChecked<FContentBrowserModule>("ContentBrowser").Get();
 		ContentBrowser.SyncBrowserToAssets(TArray<UObject*>{ Texture });
-
-		float Min = 0.0f, Max = 0.0f;
-		ValueRange(Pixels, Width, Min, Max);
-		FNumberFormattingOptions Digits;
-		Digits.SetMaximumFractionalDigits(3);
-		FText Message = FText::Format(LOCTEXT("Exported", "Exported {0} to {1} ({2}). Values range {3} to {4}."),
-			What, FText::FromString(Texture->GetName()), SizeText(Options.Size), FText::AsNumber(Min, &Digits), FText::AsNumber(Max, &Digits));
-		if (Options.Format != EFormat::HDR && (Min < -0.001f || Max > 1.001f))
-		{
-			Message = FText::Format(LOCTEXT("Clamped", "{0} Values outside 0-1 were clamped; export as HDR to keep them."), Message);
-		}
-		VrrGraph::Notify(Message, true);
+		NotifyExported(Texture, ExportName, Options, Range);
 	}
 }
 
