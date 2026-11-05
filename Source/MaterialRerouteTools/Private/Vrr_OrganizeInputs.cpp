@@ -1,23 +1,28 @@
 // Copyright VR Robotica. All Rights Reserved.
 
 /*
- * Organize Inputs into Named Reroutes: breaks the wires into the material's Result node (or a Make / Set Material
- * Attributes node) into named reroutes that carry the input's type prefix and name.
+ * Organize Inputs into Named Reroutes: breaks the wires into a node's inputs into named reroutes that carry the
+ * input's type prefix and name. Works on the material's Result node, Make / Set Material Attributes, Substrate nodes
+ * (Slab, Unlit, Hair, ... BSDFs and the Substrate operators), and any other node whose visible inputs all have
+ * descriptive names: function calls, VRR and engine C++ nodes (Vrr Cel Shadow, Custom, Texture Sample, Fresnel, ...).
+ * Nodes with generic pins (math nodes' A / B, unnamed inputs) are left out, as "vec3_A" would say nothing.
  *
  * For every wired input this adds a declaration "<prefix><input name>", with the name exactly as the node shows it
- * ("vec3_Base Color", "s_Roughness", "vec2_Customized UVs 0", ...), right next to the node that feeds it. The input
- * then reads a usage of it placed beside its pin. The value is unchanged: a channel mask on the old link moves onto
- * the declaration's input.
+ * ("vec3_Base Color", "s_Roughness", "vec3_Diffuse Albedo", "vec2_Customized UVs 0", ...), right next to the node
+ * that feeds it. The input then reads a usage of it placed beside its pin. The value is unchanged: a channel mask on
+ * the old link moves onto the declaration's input.
  *
- *  - Only the Result node's visible pins count (inputs the shading model / blend mode hides are left alone).
+ *  - Only visible pins count (Result node inputs the shading model / blend mode hides, hidden expression pins).
  *  - An input that already reads a named reroute usage is skipped, so a second run does nothing.
  *  - An input wired straight to a named reroute declaration just reads a usage of it, no new declaration.
- *  - Prefix and color follow the type the input expects (see Vrr_RerouteStyle); a normal-map sampler's RGB gets the
+ *  - Prefix and color follow the type the input expects (see Vrr_RerouteStyle): the material property for the Result
+ *    node and the attribute nodes, else the pin's type tag ("Base Color (V3)" -> "vec3_Base Color", function calls
+ *    and VRR nodes) or the type the node reports for it. A normal-map sampler's RGB gets the
  *    normal color. An input with no plain type takes what feeds it, else no prefix and grey. If the name is taken,
  *    the engine makes it unique.
  *
  * Steps
- *  1. List the node's inputs: name as shown, the input, the type it expects, its pin row.
+ *  1. Find the target node and list its inputs: name as shown, the input, the type it expects, its pin row.
  *  2. Per wired input: a declaration beside its source (or the declaration it already reads), then a usage beside
  *     the pin.
  *  3. Rebuild the graph, select the new declarations and report.
@@ -38,6 +43,7 @@
 #include "Materials/MaterialExpressionMakeMaterialAttributes.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionSetMaterialAttributes.h"
+#include "Materials/MaterialExpressionSubstrate.h"
 #include "ScopedTransaction.h"
 
 #define LOCTEXT_NAMESPACE "VrrOrganizeInputs"
@@ -50,7 +56,7 @@ namespace VrrOrganizeInputs
 		constexpr int32 SourceWidth = 300;		// declaration sits this far right of the node feeding it
 		constexpr int32 UsageMinStep = 32;		// usages beside one node never overlap
 
-		/** The node being organized: the Result node (Expression null) or a Make / Set Material Attributes node. */
+		/** The node being organized: the Result node (Expression null) or an expression node with typed inputs. */
 		struct FTarget
 		{
 			UMaterialExpression* Expression = nullptr;
@@ -59,12 +65,40 @@ namespace VrrOrganizeInputs
 			TArray<FNamedInput> Inputs;
 		};
 
-		/** A Make or Set Material Attributes node's expression, or null. */
-		UMaterialExpression* AsAttributesNode(const UEdGraphNode* Node)
+		UMaterialExpression* ExpressionOf(const UEdGraphNode* Node)
 		{
 			const UMaterialGraphNode* MaterialNode = Cast<UMaterialGraphNode>(Node);
-			UMaterialExpression* E = MaterialNode ? MaterialNode->MaterialExpression.Get() : nullptr;
-			return E && (E->IsA<UMaterialExpressionMakeMaterialAttributes>() || E->IsA<UMaterialExpressionSetMaterialAttributes>()) ? E : nullptr;
+			return MaterialNode ? MaterialNode->MaterialExpression.Get() : nullptr;
+		}
+
+		bool IsAttributesNode(const UMaterialExpression* E)
+		{
+			return E && (E->IsA<UMaterialExpressionMakeMaterialAttributes>() || E->IsA<UMaterialExpressionSetMaterialAttributes>());
+		}
+
+		/** Substrate BSDFs (Slab, Unlit, Hair, ...) and operators: the node names and types its own inputs. */
+		bool IsSubstrateNode(const UMaterialExpression* E)
+		{
+			return E && E->IsA<UMaterialExpressionSubstrateBSDF>();
+		}
+
+		/** How the report names the target node ("the Result node", "Make Material Attributes", "Substrate Slab BSDF"). */
+		FText DisplayNameOf(const FTarget& Target)
+		{
+			UMaterialExpression* E = Target.Expression;
+			if (!E)
+			{
+				return LOCTEXT("ResultNode", "the Result node");
+			}
+			if (IsAttributesNode(E))
+			{
+				return E->IsA<UMaterialExpressionMakeMaterialAttributes>()
+					? LOCTEXT("MakeAttributes", "Make Material Attributes")
+					: LOCTEXT("SetAttributes", "Set Material Attributes");
+			}
+			TArray<FString> Captions;
+			E->GetCaption(Captions);
+			return Captions.Num() > 0 ? FText::FromString(Captions[0]) : E->GetClass()->GetDisplayNameText();
 		}
 
 		/**
@@ -113,53 +147,14 @@ namespace VrrOrganizeInputs
 			return {};
 		}
 
-		/** 1. The node's inputs, in pin order (Graph is a material for the Result node). */
-		bool ListInputs(const UMaterialGraph* Graph, const UEdGraphNode* Node, FTarget& Out)
-		{
-			if (UMaterialExpression* Attributes = AsAttributesNode(Node))
-			{
-				Out.Expression = Attributes;
-				Out.X = Attributes->MaterialExpressionEditorX;
-				Out.Y = Attributes->MaterialExpressionEditorY;
-				UMaterialExpressionMakeMaterialAttributes* Make = Cast<UMaterialExpressionMakeMaterialAttributes>(Attributes);
-				for (FExpressionInputIterator It{ Attributes }; It; ++It)
-				{
-					// Pins show the input's name as display text ("BaseColor" -> "Base Color"); Set's are already
-					const FString Name = FName::NameToDisplayString(Attributes->GetInputName(It.Index).ToString(), false);
-					const TOptional<EMaterialProperty> Property = Make ? PropertyOf(Make, It.Input) : TOptional<EMaterialProperty>();
-					const EMaterialValueType Type = Property ? FMaterialAttributeDefinitionMap::GetValueType(*Property) : Attributes->GetInputValueType(It.Index);
-					Out.Inputs.Add({ Name, It.Input, Type, It.Index });
-				}
-				return true;
-			}
-			UMaterial* Material = Graph ? Graph->Material.Get() : nullptr;
-			if (!Node || !Node->IsA<UMaterialGraphNode_Root>() || !Material || Graph->MaterialFunction)
-			{
-				return false;
-			}
-			Out.X = Material->EditorX;
-			Out.Y = Material->EditorY;
-			int32 Row = 0;
-			for (const FMaterialInputInfo& Info : Graph->MaterialInputs)
-			{
-				if (Info.IsVisiblePin(Material))
-				{
-					Out.Inputs.Add({ Info.GetName().ToString(), &Info.GetExpressionInput(Material),
-						FMaterialAttributeDefinitionMap::GetValueType(Info.GetProperty()), Row++ });
-				}
-			}
-			return true;
-		}
-
 		/**
-		 * Any other node's input pin: the name as the pin shows it, its type tag split off ("Base Color (V3)", the VRR
-		 * nodes and function calls) and giving the type, else the type the node reports. A plain "float" (math nodes
-		 * take any width) counts as unknown, so the reroute follows what feeds it.
+		 * Any expression node's input: the name as the pin shows it, its type tag split off ("Base Color (V3)", the
+		 * VRR nodes and function calls) and giving the type, else the type the node reports. A plain "float" (math
+		 * nodes take any width) counts as unknown, so the reroute follows what feeds it.
 		 */
 		TOptional<FNamedInput> DescribeExpressionInput(const UEdGraphNode* Node, int32 InputIndex)
 		{
-			const UMaterialGraphNode* MaterialNode = Cast<UMaterialGraphNode>(Node);
-			UMaterialExpression* E = MaterialNode ? MaterialNode->MaterialExpression.Get() : nullptr;
+			UMaterialExpression* E = ExpressionOf(Node);
 			FExpressionInput* Input = E ? E->GetInput(InputIndex) : nullptr;
 			if (!Input)
 			{
@@ -179,12 +174,166 @@ namespace VrrOrganizeInputs
 			{
 				Type = MCT_Unknown;
 			}
-			return FNamedInput{ Name, Input, Type, InputIndex };
+			return FNamedInput{ Name, Input, Type, InputIndex, InputIndex };
+		}
+
+		/** Node's visible value inputs, in pin order (what the node shows, so also the usage rows). */
+		TArray<FNamedInput> VisibleInputsOf(const UEdGraphNode* Node)
+		{
+			TArray<FNamedInput> Inputs;
+			for (const UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Input || Pin->bHidden || Pin->PinType.PinCategory == UMaterialGraphSchema::PC_Exec)
+				{
+					continue;
+				}
+				if (TOptional<FNamedInput> Input = DescribeExpressionInput(Node, Pin->SourceIndex))
+				{
+					Input->Row = Inputs.Num();
+					Inputs.Add(MoveTemp(*Input));
+				}
+			}
+			return Inputs;
+		}
+
+		/** A pin name that says nothing on its own: unnamed or a single letter ("A", "B", "X"). */
+		bool IsGenericName(const FString& Name)
+		{
+			const FString Trimmed = Name.TrimStartAndEnd();
+			return Trimmed.Len() <= 1 || Trimmed.Equals(TEXT("None"));
+		}
+
+		/**
+		 * Any other C++ node (engine, VRR, third-party) or function call, when every visible input has a descriptive name:
+		 * Custom, Texture Sample, Fresnel, Panner, Vrr Cel Shadow, MF_ToonLit, ... Math nodes (A / B, unnamed inputs)
+		 * are left out, since "vec3_A" says nothing. Named reroute nodes are what this tool makes, so they never count.
+		 */
+		bool HasNamedInputs(const UEdGraphNode* Node, const UMaterialExpression* E)
+		{
+			if (E->IsA<UMaterialExpressionNamedRerouteBase>())
+			{
+				return false;
+			}
+			const TArray<FNamedInput> Inputs = VisibleInputsOf(Node);
+			return Inputs.Num() > 0 && !Inputs.ContainsByPredicate([](const FNamedInput& I) { return IsGenericName(I.Name); });
+		}
+
+		/** The expression of a node whose inputs can be organized (attribute, Substrate or named-input nodes), else null. */
+		UMaterialExpression* AsOrganizableExpression(const UEdGraphNode* Node)
+		{
+			UMaterialExpression* E = ExpressionOf(Node);
+			return E && (IsAttributesNode(E) || IsSubstrateNode(E) || HasNamedInputs(Node, E)) ? E : nullptr;
+		}
+
+		/**
+		 * 1a. An expression node's inputs. Attribute inputs are typed by the material property they set (Make reports a
+		 * plain float for most of them); other nodes keep what their pins report.
+		 */
+		void ListExpressionInputs(const UEdGraphNode* Node, UMaterialExpression* E, FTarget& Out)
+		{
+			Out.Inputs = VisibleInputsOf(Node);
+			if (!IsAttributesNode(E))
+			{
+				return;
+			}
+			UMaterialExpressionMakeMaterialAttributes* Make = Cast<UMaterialExpressionMakeMaterialAttributes>(E);
+			for (FNamedInput& Input : Out.Inputs)
+			{
+				const TOptional<EMaterialProperty> Property = Make ? PropertyOf(Make, Input.Input) : TOptional<EMaterialProperty>();
+				Input.Type = Property ? FMaterialAttributeDefinitionMap::GetValueType(*Property) : E->GetInputValueType(Input.Index);
+			}
+		}
+
+		/** 1b. The Result node's visible inputs, typed by material property. */
+		void ListResultInputs(const UMaterialGraph* Graph, UMaterial* Material, FTarget& Out)
+		{
+			int32 Row = 0;
+			for (const FMaterialInputInfo& Info : Graph->MaterialInputs)
+			{
+				if (Info.IsVisiblePin(Material))
+				{
+					Out.Inputs.Add({ Info.GetName().ToString(), &Info.GetExpressionInput(Material),
+						FMaterialAttributeDefinitionMap::GetValueType(Info.GetProperty()), Row++ });
+				}
+			}
+		}
+
+		/** 1. The node to organize and its inputs (Graph must be a material for the Result node). */
+		bool FindTarget(const UMaterialGraph* Graph, const UEdGraphNode* Node, FTarget& Out)
+		{
+			if (UMaterialExpression* E = AsOrganizableExpression(Node))
+			{
+				Out.Expression = E;
+				Out.X = E->MaterialExpressionEditorX;
+				Out.Y = E->MaterialExpressionEditorY;
+				ListExpressionInputs(Node, E, Out);
+				return true;
+			}
+			UMaterial* Material = Graph ? Graph->Material.Get() : nullptr;
+			if (!Node || !Node->IsA<UMaterialGraphNode_Root>() || !Material || Graph->MaterialFunction)
+			{
+				return false;
+			}
+			Out.X = Material->EditorX;
+			Out.Y = Material->EditorY;
+			ListResultInputs(Graph, Material, Out);
+			return true;
 		}
 
 		bool NeedsReroute(const FNamedInput& Input)
 		{
 			return Input.Input->Expression && !Input.Input->Expression->IsA<UMaterialExpressionNamedRerouteUsage>();
+		}
+
+		/** What one run has done so far, and where the last usage went. */
+		struct FRunState
+		{
+			TMap<UMaterialExpression*, int32> DeclarationsPerSource;	// stacks declarations beside a shared source
+			TArray<const UMaterialExpression*> NewDeclarations;
+			int32 Reused = 0;
+			int32 PreviousUsageY = MIN_int32;
+		};
+
+		/**
+		 * 2a. The declaration Entry will read: the one it's wired straight to (when there's no mask), else a new one
+		 * beside the node feeding it, carrying the old link's channel mask.
+		 */
+		UMaterialExpressionNamedRerouteDeclaration* DeclarationFor(UMaterial* Material, const FNamedInput& Entry, FRunState& Run)
+		{
+			const FExpressionInput& Input = *Entry.Input;
+			UMaterialExpression* Source = Input.Expression;
+			UMaterialExpressionNamedRerouteDeclaration* Existing = Cast<UMaterialExpressionNamedRerouteDeclaration>(Source);
+			if (Existing && !Input.Mask)
+			{
+				++Run.Reused;
+				return Existing;
+			}
+			FString Name;
+			FLinearColor Color;
+			RerouteStyleFor(Entry, Name, Color);
+			const int32 Slot = Run.DeclarationsPerSource.FindOrAdd(Source)++;
+			UMaterialExpressionNamedRerouteDeclaration* Declaration = VrrGraph::CreateDeclaration(Material, Source, Input.OutputIndex,
+				Source->MaterialExpressionEditorX + SourceWidth, Source->MaterialExpressionEditorY + Slot * VrrGraph::Layout::DeclarationStep, Name, Color);
+			if (Declaration)
+			{
+				Declaration->Input.SetMask(Input.Mask, Input.MaskR, Input.MaskG, Input.MaskB, Input.MaskA);
+				Run.NewDeclarations.Add(Declaration);
+			}
+			return Declaration;
+		}
+
+		/** 2b. The pin reads a usage of Declaration placed beside it, taking the whole value (the mask moved onto the declaration). */
+		void ReadThroughUsage(UMaterial* Material, const FTarget& Target, const FNamedInput& Entry,
+			UMaterialExpressionNamedRerouteDeclaration* Declaration, FRunState& Run)
+		{
+			FIntPoint Position = VrrGraph::UsagePositionForPin(Target.X, Target.Y, Entry.Row);
+			Position.Y = FMath::Max(Position.Y, Run.PreviousUsageY + UsageMinStep);
+			Run.PreviousUsageY = Position.Y;
+			if (UMaterialExpressionNamedRerouteUsage* Usage = VrrGraph::CreateUsage(Material, Declaration, Position))
+			{
+				VrrGraph::Rewire({ Target.Expression, Entry.Input }, Usage);
+				Entry.Input->SetMask(0, 0, 0, 0, 0);
+			}
 		}
 	}
 
@@ -196,7 +345,7 @@ namespace VrrOrganizeInputs
 		}
 		const UEdGraphNode* Node = Pin->GetOwningNode();
 		FTarget Target;
-		if (!ListInputs(Graph, Node, Target))
+		if (!FindTarget(Graph, Node, Target))
 		{
 			return DescribeExpressionInput(Node, Pin->SourceIndex);
 		}
@@ -228,28 +377,26 @@ namespace VrrOrganizeInputs
 	bool CanOrganize(const UMaterialGraph* Graph, const UEdGraphNode* Node)
 	{
 		return Graph && Graph->Material && !Graph->MaterialFunction && Node
-			&& (Node->IsA<UMaterialGraphNode_Root>() || AsAttributesNode(Node));
+			&& (Node->IsA<UMaterialGraphNode_Root>() || AsOrganizableExpression(Node));
 	}
 
 	int32 CountInputsToOrganize(UMaterialGraph* Graph, const UEdGraphNode* Node)
 	{
 		FTarget Target;
-		return CanOrganize(Graph, Node) && ListInputs(Graph, Node, Target) ? Target.Inputs.FilterByPredicate(NeedsReroute).Num() : 0;
+		return CanOrganize(Graph, Node) && FindTarget(Graph, Node, Target) ? Target.Inputs.FilterByPredicate(NeedsReroute).Num() : 0;
 	}
 
 	void OrganizeInputs(UMaterialGraph* Graph, const UEdGraphNode* Node)
 	{
 		const TSharedPtr<IMaterialEditor> Editor = VrrGraph::GetEditor(Graph);
 		FTarget Target;
-		if (!Editor.IsValid() || !CanOrganize(Graph, Node) || !ListInputs(Graph, Node, Target))
+		if (!Editor.IsValid() || !CanOrganize(Graph, Node) || !FindTarget(Graph, Node, Target))
 		{
 			return;
 		}
 		UMaterial* Material = Graph->Material;
 		const FText Tool = LOCTEXT("Tool", "Organize Inputs into Named Reroutes");
-		const FText NodeName = Target.Expression
-			? FText::FromString(Target.Expression->IsA<UMaterialExpressionMakeMaterialAttributes>() ? TEXT("Make Material Attributes") : TEXT("Set Material Attributes"))
-			: LOCTEXT("ResultNode", "the Result node");
+		const FText NodeName = DisplayNameOf(Target);
 		if (!Target.Inputs.ContainsByPredicate(NeedsReroute))
 		{
 			VrrGraph::Notify(FText::Format(LOCTEXT("NothingToDo", "{0}: no inputs of {1} need a named reroute."), Tool, NodeName), false);
@@ -264,15 +411,11 @@ namespace VrrOrganizeInputs
 		}
 
 		// 2. Per wired input: declaration beside the source, usage beside the pin
-		TMap<UMaterialExpression*, int32> DeclarationsPerSource;
-		TArray<const UMaterialExpression*> NewDeclarations;
-		int32 Reused = 0;
+		FRunState Run;
 		int32 Skipped = 0;
-		int32 PreviousUsageY = MIN_int32;
 		for (const FNamedInput& Entry : Target.Inputs)
 		{
-			FExpressionInput& Input = *Entry.Input;
-			if (!Input.Expression)
+			if (!Entry.Input->Expression)
 			{
 				continue;
 			}
@@ -281,45 +424,16 @@ namespace VrrOrganizeInputs
 				++Skipped;
 				continue;
 			}
-			UMaterialExpression* Source = Input.Expression;
-
-			// 2a. Wired straight to a declaration: read a usage of it instead of stacking a second one
-			UMaterialExpressionNamedRerouteDeclaration* Declaration = Cast<UMaterialExpressionNamedRerouteDeclaration>(Source);
-			if (Declaration && !Input.Mask)
+			if (UMaterialExpressionNamedRerouteDeclaration* Declaration = DeclarationFor(Material, Entry, Run))
 			{
-				++Reused;
-			}
-			else
-			{
-				FString Name;
-				FLinearColor Color;
-				RerouteStyleFor(Entry, Name, Color);
-				const int32 Slot = DeclarationsPerSource.FindOrAdd(Source)++;
-				Declaration = VrrGraph::CreateDeclaration(Material, Source, Input.OutputIndex,
-					Source->MaterialExpressionEditorX + SourceWidth, Source->MaterialExpressionEditorY + Slot * VrrGraph::Layout::DeclarationStep, Name, Color);
-				if (!Declaration)
-				{
-					continue;
-				}
-				Declaration->Input.SetMask(Input.Mask, Input.MaskR, Input.MaskG, Input.MaskB, Input.MaskA);
-				NewDeclarations.Add(Declaration);
-			}
-
-			// 2b. Usage beside the pin, reading the whole value (the mask now sits on the declaration)
-			FIntPoint UsagePosition = VrrGraph::UsagePositionForPin(Target.X, Target.Y, Entry.Row);
-			UsagePosition.Y = FMath::Max(UsagePosition.Y, PreviousUsageY + UsageMinStep);
-			PreviousUsageY = UsagePosition.Y;
-			if (UMaterialExpressionNamedRerouteUsage* Usage = VrrGraph::CreateUsage(Material, Declaration, UsagePosition))
-			{
-				VrrGraph::Rewire({ Target.Expression, &Input }, Usage);
-				Input.SetMask(0, 0, 0, 0, 0);
+				ReadThroughUsage(Material, Target, Entry, Declaration, Run);
 			}
 		}
 
 		// 3. Show it, select the new declarations and report
-		VrrGraph::FinishEdit(Graph, *Editor, NewDeclarations);
+		VrrGraph::FinishEdit(Graph, *Editor, Run.NewDeclarations);
 		FText Message = FText::Format(LOCTEXT("Done", "Organized the inputs of {0}: {1} new named reroute(s), {2} existing reused."),
-			NodeName, NewDeclarations.Num(), Reused);
+			NodeName, Run.NewDeclarations.Num(), Run.Reused);
 		if (Skipped > 0)
 		{
 			Message = FText::Format(LOCTEXT("DoneSkipped", "{0}\n{1} input(s) already read a named reroute."), Message, Skipped);

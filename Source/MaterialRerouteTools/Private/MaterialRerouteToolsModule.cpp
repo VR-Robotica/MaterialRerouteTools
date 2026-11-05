@@ -7,7 +7,8 @@
  *   Expression nodes, when the selection has parameters:
  *     - Organize Parameters into Named Reroutes (Vrr_OrganizeParameters)
  *     - Create Parameter Data Function, Add to Parameter Data Function > (Vrr_ParameterDataFunction)
- *   Result node and Make / Set Material Attributes nodes:
+ *   Result node, Make / Set Material Attributes, Substrate (Slab, Unlit, ...) and any node whose inputs all have
+ *   descriptive names (function calls, Vrr Cel Shadow, Custom, Texture Sample, ...; not math nodes' A / B):
  *     - Organize Inputs into Named Reroutes (Vrr_OrganizeInputs)
  *   Expression nodes with a value output (and their output pins), in materials and material functions:
  *     - Export Node to Texture... (Vrr_ExportNodeTexture)

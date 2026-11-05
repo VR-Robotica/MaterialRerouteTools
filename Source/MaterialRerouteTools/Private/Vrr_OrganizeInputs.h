@@ -11,8 +11,9 @@ class UMaterialGraph;
 struct FExpressionInput;
 
 /**
- * "Organize Inputs into Named Reroutes": for the material's Result node or a Make / Set Material Attributes node,
- * every wired input gets a named reroute declaration "<prefix><input name>" next to the node that feeds it, and the
+ * "Organize Inputs into Named Reroutes": for the material's Result node, a Make / Set Material Attributes node or a
+ * Substrate node (Slab and the other BSDFs, Substrate operators), or any node whose inputs all have descriptive names
+ * (function calls, VRR and engine C++ nodes; not math nodes' A / B), every wired input gets a named reroute declaration "<prefix><input name>" next to the node that feeds it, and the
  * input reads a usage of it placed beside the pin.
  *
  * The input naming and typing here is shared with Create Prefixed Named Reroute dragged off one of those inputs.
@@ -26,6 +27,7 @@ namespace VrrOrganizeInputs
 		FExpressionInput* Input = nullptr;
 		EMaterialValueType Type = MCT_Unknown;	// what the input expects (MCT_Unknown: work it out from what feeds it)
 		int32 Row = 0;							// pin row on the node
+		int32 Index = INDEX_NONE;				// input index on an expression node (none for the Result node)
 	};
 
 	/**
@@ -37,7 +39,7 @@ namespace VrrOrganizeInputs
 	/** Name "<prefix><input name>" and color of a reroute carrying Input: by the type it expects, else what feeds it. */
 	void RerouteStyleFor(const FNamedInput& Input, FString& OutName, FLinearColor& OutColor);
 
-	/** True for the Result node and Make / Set Material Attributes nodes of a material (not a material function). */
+	/** True for the Result node, Make / Set Material Attributes, Substrate and named-input nodes of a material (not a material function). */
 	bool CanOrganize(const UMaterialGraph* Graph, const UEdGraphNode* Node);
 
 	/** Wired inputs of Node that would get a reroute (not ones already reading a reroute usage). */
