@@ -3,3 +3,4 @@ Intermediate/
 *.sln
 .vs/
 .idea/
+__pycache__/
