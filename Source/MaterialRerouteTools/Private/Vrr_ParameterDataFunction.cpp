@@ -58,6 +58,8 @@
  */
 
 #include "Vrr_ParameterDataFunction.h"
+
+#include "Vrr_EngineCompat.h"
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_RerouteStyle.h"
 
@@ -274,11 +276,11 @@ namespace VrrParameterData
 			const int32 Width = VrrGraph::MaskWidth(Source);
 			return Width <= 1 ? FunctionInput_Scalar : Width == 2 ? FunctionInput_Vector2 : Width == 3 ? FunctionInput_Vector3 : FunctionInput_Vector4;
 		}
-		if (FromValueType(Source.Expression->GetOutputValueType(Source.OutputIndex), Result))
+		if (FromValueType(VrrCompat::OutputValueType(Source.Expression, Source.OutputIndex), Result))
 		{
 			return Result;
 		}
-		if (FromValueType(ConsumerCopy->GetInputValueType(ConsumerInputIndex), Result))
+		if (FromValueType(VrrCompat::InputValueType(ConsumerCopy, ConsumerInputIndex), Result))
 		{
 			return Result;
 		}

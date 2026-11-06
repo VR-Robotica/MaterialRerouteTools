@@ -23,6 +23,8 @@
  */
 
 #include "Vrr_PrefixedReroute.h"
+
+#include "Vrr_EngineCompat.h"
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_OrganizeInputs.h"
 #include "Vrr_RerouteStyle.h"
@@ -164,7 +166,7 @@ namespace
 		using FEdGraphSchemaAction::FEdGraphSchemaAction;
 		using FEdGraphSchemaAction::PerformAction;
 
-		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, const FVector2f& Location, bool bSelectNewNode) override
+		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, VRR_GRAPH_LOCATION Location, bool bSelectNewNode) override
 		{
 			UMaterialGraphNode* SourceNode = SourceNodeOf(FromPin);
 			if (!SourceNode)
@@ -174,7 +176,7 @@ namespace
 			const FScopedTransaction Transaction(LOCTEXT("Transaction", "Create Prefixed Named Reroute"));
 			UMaterialExpression* Source = SourceNode->MaterialExpression;
 			const VrrReroute::EKind Kind = KindOfWire(FromPin, Source);
-			UMaterialExpressionNamedRerouteDeclaration* Declaration = NewDeclaration(ParentGraph, Location, bSelectNewNode,
+			UMaterialExpressionNamedRerouteDeclaration* Declaration = NewDeclaration(ParentGraph, FVector2f(Location), bSelectNewNode,
 				OutputRerouteName(Source, FromPin->SourceIndex, Kind), VrrReroute::ColorFor(Source, FromPin->SourceIndex, Kind));
 			if (!Declaration)
 			{
@@ -200,7 +202,7 @@ namespace
 		using FEdGraphSchemaAction::FEdGraphSchemaAction;
 		using FEdGraphSchemaAction::PerformAction;
 
-		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, const FVector2f& Location, bool bSelectNewNode) override
+		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, VRR_GRAPH_LOCATION Location, bool bSelectNewNode) override
 		{
 			const UMaterialGraph* Graph = Cast<UMaterialGraph>(ParentGraph);
 			const TOptional<VrrOrganizeInputs::FNamedInput> Named = VrrOrganizeInputs::DescribeInputPin(Graph, FromPin);
@@ -215,7 +217,7 @@ namespace
 			VrrOrganizeInputs::RerouteStyleFor(*Named, Name, Color);
 
 			// 1. The declaration where the menu was opened, fed by whatever fed the input (same source pin)
-			UMaterialExpressionNamedRerouteDeclaration* Declaration = NewDeclaration(ParentGraph, Location, bSelectNewNode, Name, Color);
+			UMaterialExpressionNamedRerouteDeclaration* Declaration = NewDeclaration(ParentGraph, FVector2f(Location), bSelectNewNode, Name, Color);
 			if (!Declaration)
 			{
 				return nullptr;

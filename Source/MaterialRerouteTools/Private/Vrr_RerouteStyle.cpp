@@ -9,6 +9,8 @@
  */
 
 #include "Vrr_RerouteStyle.h"
+
+#include "Vrr_EngineCompat.h"
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_RerouteSettings.h"
 
@@ -28,7 +30,12 @@
 #include "Materials/MaterialExpressionFresnel.h"
 #include "Materials/MaterialExpressionFunctionInput.h"
 #include "Materials/MaterialExpressionFunctionOutput.h"
+#if VRR_UE_5_2
+#define VRR_IS_LENGTH(E) false	// no Length node in 5.2
+#else
 #include "Materials/MaterialExpressionLength.h"
+#define VRR_IS_LENGTH(E) (E)->IsA<UMaterialExpressionLength>()
+#endif
 #include "Materials/MaterialExpressionLightVector.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
@@ -46,7 +53,9 @@
 #include "Materials/MaterialExpressionParticleRelativeTime.h"
 #include "Materials/MaterialExpressionParticleSize.h"
 #include "Materials/MaterialExpressionParticleSpeed.h"
-#include "Materials/MaterialExpressionParticleSpriteRotation.h"
+#if !VRR_UE_5_2
+#include "Materials/MaterialExpressionParticleSpriteRotation.h"	// no Particle Sprite Rotation node in 5.2
+#endif
 #include "Materials/MaterialExpressionParticleSubUV.h"
 #include "Materials/MaterialExpressionParticleSubUVProperties.h"
 #include "Materials/MaterialExpressionPixelDepth.h"
@@ -150,7 +159,7 @@ namespace VrrReroute
 				[Collection](const FCollectionVectorParameter& P) { return P.Id == Collection->ParameterId || P.ParameterName == Collection->ParameterName; });
 			return bVector ? EKind::Vector4 : EKind::Scalar;
 		}
-		return KindOfType(Source->GetOutputValueType(Pin));
+		return KindOfType(VrrCompat::OutputValueType(Source, Pin));
 	}
 
 	EKind KindOfType(EMaterialValueType Type)
@@ -235,42 +244,44 @@ namespace VrrReroute
 		{
 			static const TArray<FEngineInput> Inputs = {
 				{ UMaterialExpressionTextureCoordinate::StaticClass(),  TEXT("UV"),                   EKind::Vector2 },	// + index
-				{ UMaterialExpressionScreenPosition::StaticClass(),     nullptr,                      EKind::Vector2 },	// Viewport UV, Pixel Position
-				{ UMaterialExpressionViewSize::StaticClass(),           TEXT("View Size"),            EKind::Vector2 },
+				{ VRR_EXPRESSION_CLASS(ScreenPosition),     nullptr,                      EKind::Vector2 },	// Viewport UV, Pixel Position
+				{ VRR_EXPRESSION_CLASS(ViewSize),           TEXT("View Size"),            EKind::Vector2 },
 				{ UMaterialExpressionWorldPosition::StaticClass(),      TEXT("World Position"),       EKind::Unknown },
-				{ UMaterialExpressionObjectPositionWS::StaticClass(),   TEXT("Object Position"),      EKind::Vector3 },
-				{ UMaterialExpressionActorPositionWS::StaticClass(),    TEXT("Actor Position"),       EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(ObjectPositionWS),   TEXT("Object Position"),      EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(ActorPositionWS),    TEXT("Actor Position"),       EKind::Vector3 },
 				{ UMaterialExpressionCameraPositionWS::StaticClass(),   TEXT("Camera Position"),      EKind::Vector3 },
-				{ UMaterialExpressionParticlePositionWS::StaticClass(), TEXT("Particle Position"),    EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(ParticlePositionWS), TEXT("Particle Position"),    EKind::Vector3 },
 				{ UMaterialExpressionVertexNormalWS::StaticClass(),     TEXT("Vertex Normal"),        EKind::Vector3 },
 				{ UMaterialExpressionPixelNormalWS::StaticClass(),      TEXT("Pixel Normal"),         EKind::Vector3 },
 				{ UMaterialExpressionVertexTangentWS::StaticClass(),    TEXT("Vertex Tangent"),       EKind::Vector3 },
 				{ UMaterialExpressionCameraVectorWS::StaticClass(),     TEXT("Camera Vector"),        EKind::Vector3 },
 				{ UMaterialExpressionReflectionVectorWS::StaticClass(), TEXT("Reflection Vector"),    EKind::Vector3 },
-				{ UMaterialExpressionLightVector::StaticClass(),        TEXT("Light Vector"),         EKind::Vector3 },
-				{ UMaterialExpressionObjectBounds::StaticClass(),       TEXT("Object Bounds"),        EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(LightVector),        TEXT("Light Vector"),         EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(ObjectBounds),       TEXT("Object Bounds"),        EKind::Vector3 },
 				{ UMaterialExpressionObjectOrientation::StaticClass(),  TEXT("Object Orientation"),   EKind::Vector3 },
-				{ UMaterialExpressionObjectRadius::StaticClass(),       TEXT("Object Radius"),        EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(ObjectRadius),       TEXT("Object Radius"),        EKind::Scalar },
 				{ UMaterialExpressionTwoSidedSign::StaticClass(),       TEXT("Two Sided Sign"),       EKind::Scalar },
 				{ UMaterialExpressionTime::StaticClass(),               TEXT("Time"),                 EKind::Scalar },
 				{ UMaterialExpressionPixelDepth::StaticClass(),         TEXT("Pixel Depth"),          EKind::Unknown },
-				{ UMaterialExpressionSceneDepth::StaticClass(),         TEXT("Scene Depth"),          EKind::Unknown },
+				{ VRR_EXPRESSION_CLASS(SceneDepth),         TEXT("Scene Depth"),          EKind::Unknown },
 				{ UMaterialExpressionPreSkinnedPosition::StaticClass(), TEXT("Pre-Skinned Position"), EKind::Unknown },
 				{ UMaterialExpressionPreSkinnedNormal::StaticClass(),   TEXT("Pre-Skinned Normal"),   EKind::Unknown },
 				{ UMaterialExpressionVertexColor::StaticClass(),        TEXT("Vertex Color"),         EKind::Unknown },
-				{ UMaterialExpressionParticleColor::StaticClass(),      TEXT("Particle Color"),       EKind::Unknown },
-				{ UMaterialExpressionParticleRadius::StaticClass(),     TEXT("Particle Radius"),      EKind::Scalar },
-				{ UMaterialExpressionParticleSize::StaticClass(),       TEXT("Particle Size"),        EKind::Vector2 },	// width, height
-				{ UMaterialExpressionParticleRelativeTime::StaticClass(), TEXT("Particle Relative Time"), EKind::Scalar },	// 0-1 over its life
-				{ UMaterialExpressionParticleDirection::StaticClass(),  TEXT("Particle Direction"),   EKind::Vector3 },
-				{ UMaterialExpressionParticleSpeed::StaticClass(),      TEXT("Particle Speed"),       EKind::Scalar },
-				{ UMaterialExpressionParticleRandom::StaticClass(),     TEXT("Particle Random"),      EKind::Scalar },
-				{ UMaterialExpressionParticleMotionBlurFade::StaticClass(), TEXT("Particle Motion Blur Fade"), EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(ParticleColor),      TEXT("Particle Color"),       EKind::Unknown },
+				{ VRR_EXPRESSION_CLASS(ParticleRadius),     TEXT("Particle Radius"),      EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(ParticleSize),       TEXT("Particle Size"),        EKind::Vector2 },	// width, height
+				{ VRR_EXPRESSION_CLASS(ParticleRelativeTime), TEXT("Particle Relative Time"), EKind::Scalar },	// 0-1 over its life
+				{ VRR_EXPRESSION_CLASS(ParticleDirection),  TEXT("Particle Direction"),   EKind::Vector3 },
+				{ VRR_EXPRESSION_CLASS(ParticleSpeed),      TEXT("Particle Speed"),       EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(ParticleRandom),     TEXT("Particle Random"),      EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(ParticleMotionBlurFade), TEXT("Particle Motion Blur Fade"), EKind::Scalar },
+#if !VRR_UE_5_2
 				{ UMaterialExpressionParticleSpriteRotation::StaticClass(), TEXT("Particle Sprite Rotation"), EKind::Unknown },	// Rad / Deg pins (masked)
-				{ UMaterialExpressionParticleMacroUV::StaticClass(),    TEXT("Particle Macro UV"),    EKind::Vector2 },
+#endif
+				{ VRR_EXPRESSION_CLASS(ParticleMacroUV),    TEXT("Particle Macro UV"),    EKind::Vector2 },
 				{ UMaterialExpressionParticleSubUVProperties::StaticClass(), TEXT("Particle SubUV"), EKind::Unknown },	// UV0 / UV1 (masked), Blend
 				{ UMaterialExpressionParticleSubUV::StaticClass(),      TEXT("Particle SubUV"),       EKind::Unknown },	// a sampler: pins masked
-				{ UMaterialExpressionSphericalParticleOpacity::StaticClass(), TEXT("Spherical Particle Opacity"), EKind::Scalar },
+				{ VRR_EXPRESSION_CLASS(SphericalParticleOpacity), TEXT("Spherical Particle Opacity"), EKind::Scalar },
 				{ UMaterialExpressionDynamicParameter::StaticClass(),   TEXT("Dynamic Parameter"),    EKind::Unknown },	// pins masked
 			};
 			return Inputs.FindByPredicate([E](const FEngineInput& Input) { return E->IsA(Input.Class); });
@@ -361,7 +372,7 @@ namespace VrrReroute
 
 				// The node knows its type (parameters, samplers, masked outputs, VRR nodes, ...)
 				// (a collection parameter says "float" either way: KindOf asks its collection)
-				const EMaterialValueType Reported = E->GetOutputValueType(OutputPin);
+				const EMaterialValueType Reported = VrrCompat::OutputValueType(E, OutputPin);
 				const bool bUntyped = Reported == MCT_Unknown;	// e.g. Static Switch Parameter: whatever it switches between
 				if (E->IsA<UMaterialExpressionCollectionParameter>() || (Reported != MCT_Float && !bUntyped)
 					|| (Outputs.IsValidIndex(OutputPin) && Outputs[OutputPin].Mask))
@@ -383,7 +394,7 @@ namespace VrrReroute
 				{
 					return KindForWidth(FMath::Min(WidthOf(Link(Append->A)) + WidthOf(Link(Append->B)), 4));
 				}
-				if (E->IsA<UMaterialExpressionDotProduct>() || E->IsA<UMaterialExpressionLength>() || E->IsA<UMaterialExpressionDistance>()
+				if (E->IsA<UMaterialExpressionDotProduct>() || VRR_IS_LENGTH(E) || E->IsA<UMaterialExpressionDistance>()
 					|| E->IsA<UMaterialExpressionFresnel>())
 				{
 					return EKind::Scalar;
@@ -445,11 +456,20 @@ namespace VrrReroute
 			return NAME_None;
 		}
 
-		/** "Camera Relative <Name>" for a position node set to camera relative, else Name. */
-		FString WithOrigin(const TCHAR* Name, EPositionOrigin Origin)
+#if !VRR_UE_5_2
+		/** True for a position node set to camera relative. */
+		template <typename TPositionNode>
+		bool IsCameraRelative(const TPositionNode* Node)
 		{
-			return Origin == EPositionOrigin::CameraRelative ? FString::Printf(TEXT("Camera Relative %s"), Name) : FString(Name);
+			return Node->OriginType == EPositionOrigin::CameraRelative;
 		}
+
+		/** "Camera Relative <Name>" for a position node set to camera relative, else Name. */
+		FString WithOrigin(const TCHAR* Name, bool bCameraRelative)
+		{
+			return bCameraRelative ? FString::Printf(TEXT("Camera Relative %s"), Name) : FString(Name);
+		}
+#endif
 
 		/** An engine input node's pin: after the node, with its variant and, on a node with several pins, its channel. */
 		FString EngineInputName(const FEngineInput& Input, const UMaterialExpression* Source, int32 Pin)
@@ -467,20 +487,33 @@ namespace VrrReroute
 				const FString Channels = Outputs.IsValidIndex(Pin) ? Outputs[Pin].OutputName.ToString() : FString();
 				return Channels.IsEmpty() || Channels == TEXT("XYZ") ? Base : FString::Printf(TEXT("%s %s"), *Base, *Channels);
 			}
+#if VRR_UE_5_2
+			// No Cast<> to these in 5.2 (not exported); their positions are always absolute
+			if (Source->IsA(VRR_EXPRESSION_CLASS(ObjectPositionWS)))
+			{
+				const bool bLight = Source->Material && Source->Material->MaterialDomain == MD_LightFunction;
+				return bLight ? FString(TEXT("Light Position")) : FString(Input.Name);
+			}
+#else
 			if (const UMaterialExpressionObjectPositionWS* Object = Cast<UMaterialExpressionObjectPositionWS>(Source))
 			{
 				const bool bLight = Object->Material && Object->Material->MaterialDomain == MD_LightFunction;
-				return WithOrigin(bLight ? TEXT("Light Position") : Input.Name, Object->OriginType);
+				return WithOrigin(bLight ? TEXT("Light Position") : Input.Name, IsCameraRelative(Object));
 			}
 			if (const UMaterialExpressionActorPositionWS* Actor = Cast<UMaterialExpressionActorPositionWS>(Source))
 			{
-				return WithOrigin(Input.Name, Actor->OriginType);
+				return WithOrigin(Input.Name, IsCameraRelative(Actor));
 			}
 			if (const UMaterialExpressionParticlePositionWS* Particle = Cast<UMaterialExpressionParticlePositionWS>(Source))
 			{
-				return WithOrigin(Input.Name, Particle->OriginType);
+				return WithOrigin(Input.Name, IsCameraRelative(Particle));
 			}
+#endif
+#if VRR_UE_5_2
+			if (Source->IsA<UMaterialExpressionParticleSubUVProperties>())
+#else
 			if (Source->IsA<UMaterialExpressionParticleSpriteRotation>() || Source->IsA<UMaterialExpressionParticleSubUVProperties>())
+#endif
 			{
 				// Named pins: "Particle Sprite Rotation Rad" / "... Deg", "Particle SubUV UV0" / "... UV1" / "... Blend"
 				FString PinName = Outputs.IsValidIndex(Pin) ? Outputs[Pin].OutputName.ToString() : FString();

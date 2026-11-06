@@ -43,7 +43,7 @@
 #include "Materials/MaterialExpressionMakeMaterialAttributes.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionSetMaterialAttributes.h"
-#include "Materials/MaterialExpressionSubstrate.h"
+#include "Vrr_EngineCompat.h"
 #include "ScopedTransaction.h"
 
 #define LOCTEXT_NAMESPACE "VrrOrganizeInputs"
@@ -121,7 +121,9 @@ namespace VrrOrganizeInputs
 				{ &FMake::Normal, MP_Normal },
 				{ &FMake::Tangent, MP_Tangent },
 				{ &FMake::WorldPositionOffset, MP_WorldPositionOffset },
+#if !VRR_UE_5_2
 				{ &FMake::Displacement, MP_Displacement },
+#endif
 				{ &FMake::SubsurfaceColor, MP_SubsurfaceColor },
 				{ &FMake::ClearCoat, MP_CustomData0 },
 				{ &FMake::ClearCoatRoughness, MP_CustomData1 },
@@ -169,7 +171,7 @@ namespace VrrOrganizeInputs
 			{
 				Name = FName::NameToDisplayString(Name, false);	// property names: "BaseColor" -> "Base Color"
 			}
-			EMaterialValueType Type = Tagged != VrrReroute::EKind::Unknown ? VrrReroute::TypeOfKind(Tagged) : E->GetInputValueType(InputIndex);
+			EMaterialValueType Type = Tagged != VrrReroute::EKind::Unknown ? VrrReroute::TypeOfKind(Tagged) : VrrCompat::InputValueType(E, InputIndex);
 			if (Type == MCT_Float)
 			{
 				Type = MCT_Unknown;
@@ -240,7 +242,7 @@ namespace VrrOrganizeInputs
 			for (FNamedInput& Input : Out.Inputs)
 			{
 				const TOptional<EMaterialProperty> Property = Make ? PropertyOf(Make, Input.Input) : TOptional<EMaterialProperty>();
-				Input.Type = Property ? FMaterialAttributeDefinitionMap::GetValueType(*Property) : E->GetInputValueType(Input.Index);
+				Input.Type = Property ? FMaterialAttributeDefinitionMap::GetValueType(*Property) : VrrCompat::InputValueType(E, Input.Index);
 			}
 		}
 

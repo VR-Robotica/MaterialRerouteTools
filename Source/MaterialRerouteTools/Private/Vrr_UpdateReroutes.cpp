@@ -1,6 +1,8 @@
 // Copyright VR Robotica. All Rights Reserved.
 
 #include "Vrr_UpdateReroutes.h"
+
+#include "Vrr_EngineCompat.h"
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_RerouteStyle.h"
 
@@ -157,7 +159,7 @@ namespace
 		const FText Message = FText::Format(LOCTEXT("Confirm",
 			"Rename {0} named reroute(s) to match the type they carry? Usages follow, and renamed reroutes get their type's color.\n\n{1}"),
 			Plan.Renames.Num(), FText::Join(FText::FromString(TEXT("\n")), Lines));
-		return FMessageDialog::Open(EAppMsgType::OkCancel, Message, LOCTEXT("ConfirmTitle", "Update Named Reroute Prefixes")) == EAppReturnType::Ok;
+		return VrrCompat::OpenDialog(EAppMsgType::OkCancel, Message, LOCTEXT("ConfirmTitle", "Update Named Reroute Prefixes")) == EAppReturnType::Ok;
 	}
 
 	/** Every usage of the given declarations: renaming one reconstructs them, so they go in the undo step too. */
@@ -197,7 +199,7 @@ namespace
 		{
 		}
 
-		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, const FVector2f& Location, bool bSelectNewNode) override
+		virtual UEdGraphNode* PerformAction(UEdGraph* ParentGraph, UEdGraphPin* FromPin, VRR_GRAPH_LOCATION Location, bool bSelectNewNode) override
 		{
 			if (UMaterialGraph* Graph = Cast<UMaterialGraph>(ParentGraph))
 			{

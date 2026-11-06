@@ -2,6 +2,8 @@
 
 #include "Vrr_MaterialGraphUtils.h"
 
+#include "Vrr_EngineCompat.h"
+
 #include "Framework/Notifications/NotificationManager.h"
 #include "IMaterialEditor.h"
 #include "MaterialEditingLibrary.h"
@@ -12,6 +14,7 @@
 #include "Materials/MaterialExpressionDynamicParameter.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
 #include "Materials/MaterialExpressionTextureSample.h"
+#include "Materials/MaterialExpressionTextureSampleParameter.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialFunction.h"
 #include "Widgets/Notifications/SNotificationList.h"
@@ -102,6 +105,11 @@ namespace VrrGraph
 			}
 			return Names;
 		}
+#if VRR_UE_5_2
+		// 5.2 keeps channel names on texture sample parameters only
+		const UMaterialExpressionTextureSampleParameter* SampleParameter = Cast<UMaterialExpressionTextureSampleParameter>(E);
+		return SampleParameter ? SampleParameter->ChannelNames : FParameterChannelNames();
+#else
 		const UMaterialExpressionTextureSample* Sample = Cast<UMaterialExpressionTextureSample>(E);
 		if (!Sample)
 		{
@@ -117,6 +125,7 @@ namespace VrrGraph
 			}
 		}
 		return Own;
+#endif
 	}
 
 	FString ChannelName(const UMaterialExpression* E, const FString& Base, int32 Channel)
@@ -233,7 +242,11 @@ namespace VrrGraph
 		{
 			G->NotifyGraphChanged();
 		}
+#if VRR_UE_5_2
+		FMaterialEditorUtilities::UpdateMaterialAfterGraphChange(Graph);	// 5.2 has no MarkMaterialDirty; this also flags Apply
+#else
 		FMaterialEditorUtilities::MarkMaterialDirty(Graph);
+#endif
 	}
 
 	bool IsNamedRerouteNode(const UEdGraphNode* Node)

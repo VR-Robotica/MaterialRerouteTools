@@ -18,7 +18,7 @@ import zipfile
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))	# the folder above Scripts/
 SHIPPED = ['MaterialRerouteTools.uplugin', 'README.md', 'Config', 'Resources', 'Source']
-VERSIONS = ['5.6', '5.7', '5.8']	# engine versions the plugin is built and tested on
+VERSIONS = ['5.2', '5.6', '5.7', '5.8']	# engine versions the plugin is built and tested on
 
 
 def git(*args):

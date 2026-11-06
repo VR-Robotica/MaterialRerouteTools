@@ -41,6 +41,8 @@
 #include "MaterialEditingLibrary.h"
 #include "MaterialGraph/MaterialGraph.h"
 #include "MaterialGraph/MaterialGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
+#include "MaterialDomain.h"
 #include "MaterialShared.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionComponentMask.h"
@@ -48,7 +50,7 @@
 #include "Materials/MaterialExpressionFunctionOutput.h"
 #include "Materials/MaterialExpressionMaterialFunctionCall.h"
 #include "Materials/MaterialExpressionNamedReroute.h"
-#include "Materials/MaterialExpressionSubstrate.h"
+#include "Vrr_EngineCompat.h"
 #include "Materials/MaterialFunction.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/EngineVersionComparison.h"
@@ -102,8 +104,8 @@ namespace VrrExportNode
 		constexpr int32 DefaultResolution = 1024;
 
 		/** Value types a texture can't hold. */
-		constexpr uint64 NonValueTypes = static_cast<uint64>(MCT_Texture) | MCT_SparseVolumeTexture | MCT_StaticBool | MCT_Bool | MCT_MaterialAttributes
-			| MCT_ShadingModel | MCT_Substrate | MCT_Execution | MCT_VoidStatement | MCT_VTPageTableResult | MCT_TextureCollection;
+		constexpr uint64 NonValueTypes = static_cast<uint64>(MCT_Texture) | VRR_MCT_SPARSE_VOLUME_TEXTURE | MCT_StaticBool | MCT_Bool | MCT_MaterialAttributes
+			| MCT_ShadingModel | MCT_Substrate | MCT_Execution | MCT_VoidStatement | MCT_VTPageTableResult | VRR_MCT_TEXTURE_COLLECTION;
 
 		UMaterialExpression* GetExpression(const UEdGraphNode* Node)
 		{
@@ -576,7 +578,11 @@ namespace VrrExportNode
 			{
 #if UE_VERSION_OLDER_THAN(5, 7, 0)
 				TArray<ERHIFeatureLevel::Type, TInlineAllocator<2>> ShaderTargets;
+#if VRR_UE_5_2
+				ShaderTargets.Add(EditorWorld->FeatureLevel);
+#else
 				ShaderTargets.Add(EditorWorld->GetFeatureLevel());
+#endif
 				ShaderTargets.AddUnique(GMaxRHIFeatureLevel);
 				auto GetTargetName = [](ERHIFeatureLevel::Type FeatureLevel)
 				{
@@ -729,7 +735,7 @@ namespace VrrExportNode
 				"- It reads something the bake doesn't have (world position, vertex data, scene textures, per-instance data).\n"
 				"- A sampled texture isn't loaded (virtual textures especially).{0}\n\n"
 				"Save the black texture anyway?"), FText::FromString(FoundCauses));
-			return FMessageDialog::Open(EAppMsgType::YesNo, Message, LOCTEXT("BlackResultTitle", "Export Node to Texture")) == EAppReturnType::Yes;
+			return VrrCompat::OpenDialog(EAppMsgType::YesNo, Message, LOCTEXT("BlackResultTitle", "Export Node to Texture")) == EAppReturnType::Yes;
 		}
 
 		/** Writes Pixels into the texture at ObjectPath, created or updated in place if it's already a texture. */
@@ -826,7 +832,7 @@ namespace VrrExportNode
 		const TArray<FExpressionOutput>& Outputs = Expression->GetOutputs();
 		for (int32 OutputIndex = 0; OutputIndex < Outputs.Num(); ++OutputIndex)
 		{
-			if ((static_cast<uint64>(Expression->GetOutputValueType(OutputIndex)) & NonValueTypes) != 0)
+			if ((static_cast<uint64>(VrrCompat::OutputValueType(Expression, OutputIndex)) & NonValueTypes) != 0)
 			{
 				continue;
 			}
@@ -858,7 +864,7 @@ namespace VrrExportNode
 		}
 		while (!Pending.IsEmpty())
 		{
-			UMaterialExpression* Current = Pending.Pop(EAllowShrinking::No);
+			UMaterialExpression* Current = Pending.Pop(VRR_NO_SHRINK);
 			if (!Current || Visited.Contains(Current))
 			{
 				continue;
@@ -942,7 +948,7 @@ namespace VrrExportNode
 
 		// 2. Destination, named after the asset (not the editor's transient copy)
 		const TArray<UObject*>* EditedObjects = MaterialEditor->GetObjectsCurrentlyBeingEdited();
-		const UObject* EditedAsset = EditedObjects && EditedObjects->Num() > 0 ? (*EditedObjects)[0] : Graph->GetMaterialOrFunction();
+		const UObject* EditedAsset = EditedObjects && EditedObjects->Num() > 0 ? (*EditedObjects)[0] : VrrCompat::MaterialOrFunctionOf(Graph);
 		FString TextureObjectPath;
 		if (!AskTextureObjectPath(EditedAsset, MakeDefaultTextureName(EditedAsset, NodeTitle, *Output), TextureObjectPath))
 		{

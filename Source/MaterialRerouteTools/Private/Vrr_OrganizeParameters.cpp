@@ -31,6 +31,8 @@
  */
 
 #include "Vrr_OrganizeParameters.h"
+
+#include "Vrr_EngineCompat.h"
 #include "Vrr_MaterialGraphUtils.h"
 #include "Vrr_RerouteStyle.h"
 
